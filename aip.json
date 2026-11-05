@@ -1,0 +1,8 @@
+{
+    "providers": [
+        "claude-code"
+    ],
+    "require": {
+        "floriankraemer/symfony": "dev-master"
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "aip"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Package and skill manager for AI agent harnesses"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }

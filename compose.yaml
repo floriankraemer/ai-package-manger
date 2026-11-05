@@ -1,0 +1,19 @@
+services:
+  dev:
+    image: aip-dev
+    build:
+      context: .
+      args:
+        UID: ${HOST_UID:-1000}
+        GID: ${HOST_GID:-1000}
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      # Caches live in named volumes: fast on WSL/macOS bind mounts, survive container restarts.
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/target
+
+volumes:
+  cargo-registry:
+  cargo-target:
