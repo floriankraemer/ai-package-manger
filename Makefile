@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help image shell clean nuke build release dist run fmt fmt-check lint test check
+.PHONY: help image shell clean nuke build release dist run fmt fmt-check lint test coverage check
 
 # Run containers as the host user so no root-owned files land in the repo.
 export HOST_UID := $(shell id -u)
@@ -83,5 +83,9 @@ test: ## Run tests
 	$(call step,Testing)
 	@$(DEV) cargo test
 
-check: fmt-check lint test ## Run all quality checks
+coverage: ## Run tests with coverage; fails below 85% line coverage
+	$(call step,Measuring coverage)
+	@$(DEV) cargo llvm-cov --fail-under-lines 85 --summary-only
+
+check: fmt-check lint coverage ## Run all quality checks
 	@printf '$(GREEN)✔ All checks passed$(RESET)\n'

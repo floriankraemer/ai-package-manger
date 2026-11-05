@@ -2,7 +2,9 @@
 # Includes the MinGW-w64 cross toolchain so `make dist` can also produce a Windows binary.
 FROM rust:1.97-slim
 
-RUN rustup component add rustfmt clippy \
+RUN rustup component add rustfmt clippy llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked \
+    && rm -rf "${CARGO_HOME}/registry" \
     && rustup target add x86_64-pc-windows-gnu \
     && apt-get update \
     && apt-get install -y --no-install-recommends git gcc-mingw-w64-x86-64 \
