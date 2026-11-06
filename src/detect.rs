@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -23,8 +24,10 @@ pub struct Provider {
     pub name: &'static str,
     pub project: &'static [&'static str],
     pub global: &'static [&'static str],
-    /// Environment variable that relocates the provider's global config directory.
-    pub global_env: Option<&'static str>,
+    /// `(variable, prefix)`: when the variable names an absolute directory, it replaces the
+    /// home-relative `prefix` (e.g. `.claude`) of every global path under that prefix.
+    /// An empty prefix means the variable replaces the home folder itself.
+    pub global_env: Option<(&'static str, &'static str)>,
     /// Skill folders `(project, global)`, relative like markers; `None` if skills are unsupported.
     pub skills: Option<(&'static str, &'static str)>,
 }
@@ -40,7 +43,9 @@ pub const PROVIDERS: &[Provider] = &[
         name: "Claude Code",
         project: &[".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json"],
         global: &[".claude/", ".claude.json"],
-        global_env: Some("CLAUDE_CONFIG_DIR"),
+        // https://code.claude.com/docs/en/settings ("set CLAUDE_CONFIG_DIR" to keep settings,
+        // history and plugins elsewhere); skills live in `$CLAUDE_CONFIG_DIR/skills`.
+        global_env: Some(("CLAUDE_CONFIG_DIR", ".claude")),
         skills: Some((".claude/skills", ".claude/skills")),
     },
     Provider {
@@ -48,7 +53,9 @@ pub const PROVIDERS: &[Provider] = &[
         name: "OpenAI Codex",
         project: &[".codex/"],
         global: &[".codex/"],
-        global_env: Some("CODEX_HOME"),
+        // Detection only: Codex reads user skills from `~/.agents/skills`, not `$CODEX_HOME`.
+        // https://learn.chatgpt.com/docs/build-skills
+        global_env: Some(("CODEX_HOME", ".codex")),
         skills: Some((".agents/skills", ".agents/skills")),
     },
     Provider {
@@ -64,7 +71,9 @@ pub const PROVIDERS: &[Provider] = &[
         name: "Gemini CLI",
         project: &[".gemini/", "GEMINI.md"],
         global: &[".gemini/"],
-        global_env: None,
+        // `GEMINI_CLI_HOME` replaces the home folder; `.gemini` is created inside it.
+        // https://geminicli.com/docs/reference/configuration
+        global_env: Some(("GEMINI_CLI_HOME", "")),
         skills: Some((".gemini/skills", ".gemini/skills")),
     },
     Provider {
@@ -85,7 +94,9 @@ pub const PROVIDERS: &[Provider] = &[
             ".github/agents/",
         ],
         global: &[".copilot/"],
-        global_env: None,
+        // `COPILOT_HOME` replaces `~/.copilot`, which holds `skills/`.
+        // https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference
+        global_env: Some(("COPILOT_HOME", ".copilot")),
         skills: Some((".github/skills", ".copilot/skills")),
     },
     Provider {
@@ -177,6 +188,14 @@ pub fn global_root() -> Option<PathBuf> {
 
 /// Detects providers configured directly under `root`, in table order.
 pub fn detect(root: &Path, scope: Scope) -> io::Result<Vec<Detection>> {
+    detect_with(root, scope, &|k| env::var_os(k))
+}
+
+fn detect_with(
+    root: &Path,
+    scope: Scope,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> io::Result<Vec<Detection>> {
     if !root.metadata()?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
@@ -190,17 +209,11 @@ pub fn detect(root: &Path, scope: Scope) -> io::Result<Vec<Detection>> {
                 Scope::Project => p.project,
                 Scope::Global => p.global,
             };
-            let mut markers: Vec<String> = candidates
+            let markers: Vec<String> = candidates
                 .iter()
-                .filter(|m| marker_path(root, m).exists())
+                .filter(|m| scoped_path_with(p, scope, root, m, lookup).exists())
                 .map(|m| m.to_string())
                 .collect();
-            if scope == Scope::Global
-                && let Some(var) = p.global_env
-                && env::var_os(var).is_some_and(|dir| Path::new(&dir).is_dir())
-            {
-                markers.push(format!("${var}"));
-            }
             (!markers.is_empty()).then_some(Detection {
                 id: p.id,
                 name: p.name,
@@ -208,6 +221,45 @@ pub fn detect(root: &Path, scope: Scope) -> io::Result<Vec<Detection>> {
             })
         })
         .collect())
+}
+
+/// Resolves `rel` (a marker or skill folder of `provider`) for `scope` under `root`.
+/// In global scope, the provider's config-home variable (see [`Provider::global_env`]) wins.
+pub fn scoped_path(provider: &Provider, scope: Scope, root: &Path, rel: &str) -> PathBuf {
+    scoped_path_with(provider, scope, root, rel, &|k| env::var_os(k))
+}
+
+fn scoped_path_with(
+    provider: &Provider,
+    scope: Scope,
+    root: &Path,
+    rel: &str,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> PathBuf {
+    if scope == Scope::Global
+        && let Some((var, prefix)) = provider.global_env
+        && let Some(base) = override_dir(lookup, var)
+        && let Some(rest) = strip_components(rel, prefix)
+    {
+        return marker_path(&base, rest);
+    }
+    marker_path(root, rel)
+}
+
+/// The variable's value if set, non-empty and absolute.
+/// ponytail: relative values are ignored as unset because the tools' behaviour is undocumented.
+fn override_dir(lookup: &dyn Fn(&str) -> Option<OsString>, var: &str) -> Option<PathBuf> {
+    lookup(var).map(PathBuf::from).filter(|p| p.is_absolute())
+}
+
+/// `rel` without the leading `prefix` components, or `None` if it does not start with them.
+fn strip_components<'a>(rel: &'a str, prefix: &str) -> Option<&'a str> {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Some(rel);
+    }
+    let rest = rel.strip_prefix(prefix)?;
+    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
 }
 
 /// Joins a `/`-separated marker onto `root` component-wise, so paths are native on every OS.
@@ -285,5 +337,89 @@ mod tests {
         let err = detect(&root.join("file.txt"), Scope::Project).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    fn skills_dir(id: &str, vars: &[(&str, &str)]) -> PathBuf {
+        let p = provider(id).unwrap();
+        let rel = p.skills.unwrap().1;
+        scoped_path_with(p, Scope::Global, Path::new("/home/u"), rel, &lookup(vars))
+    }
+
+    #[test]
+    fn global_skills_follow_config_home_variables() {
+        let claude = skills_dir("claude-code", &[("CLAUDE_CONFIG_DIR", "/cfg/claude")]);
+        assert_eq!(claude, Path::new("/cfg/claude/skills"));
+        let copilot = skills_dir("copilot", &[("COPILOT_HOME", "/cfg/cp")]);
+        assert_eq!(copilot, Path::new("/cfg/cp/skills"));
+        let gemini = skills_dir("gemini-cli", &[("GEMINI_CLI_HOME", "/cfg/g")]);
+        assert_eq!(gemini, Path::new("/cfg/g/.gemini/skills"));
+    }
+
+    #[test]
+    fn codex_home_does_not_move_agents_skills() {
+        let dir = skills_dir("codex", &[("CODEX_HOME", "/cfg/codex")]);
+        assert_eq!(dir, Path::new("/home/u/.agents/skills"));
+    }
+
+    #[test]
+    fn unset_empty_or_relative_variable_falls_back_to_home() {
+        for vars in [
+            &[][..],
+            &[("CLAUDE_CONFIG_DIR", "")],
+            &[("CLAUDE_CONFIG_DIR", "rel/dir")],
+        ] {
+            assert_eq!(
+                skills_dir("claude-code", vars),
+                Path::new("/home/u/.claude/skills")
+            );
+        }
+    }
+
+    #[test]
+    fn project_scope_ignores_variables() {
+        let p = provider("claude-code").unwrap();
+        let path = scoped_path_with(
+            p,
+            Scope::Project,
+            Path::new("/proj"),
+            ".claude/skills",
+            &lookup(&[("CLAUDE_CONFIG_DIR", "/cfg")]),
+        );
+        assert_eq!(path, Path::new("/proj/.claude/skills"));
+    }
+
+    #[test]
+    fn global_detection_looks_in_overridden_location() {
+        let home = fixture("env-home", &[]);
+        let cfg = fixture("env-cfg", &[".claude/"]);
+        let cfg_dir = cfg.join(".claude");
+        let vars = [("CLAUDE_CONFIG_DIR", cfg_dir.to_str().unwrap())];
+        let found = detect_with(&home, Scope::Global, &lookup(&vars)).unwrap();
+        assert_eq!(ids(&found), ["claude-code"]);
+        assert_eq!(found[0].markers, [".claude/"]);
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(cfg).unwrap();
+    }
+
+    #[test]
+    fn strip_components_matches_whole_components_only() {
+        assert_eq!(
+            strip_components(".claude/skills", ".claude"),
+            Some("/skills")
+        );
+        assert_eq!(strip_components(".claude.json", ".claude"), None);
+        assert_eq!(strip_components("x/y", ""), Some("x/y"));
     }
 }

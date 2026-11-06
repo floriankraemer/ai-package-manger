@@ -42,7 +42,7 @@ Every module also uses `Error`, `Result` and `Context` from `lib.rs`; those arro
 | `ops.rs` | All use cases. Resolves packages, builds a plan, writes lock and files. | `install`, `update`, `remove`, `search`, `Project`, `Resolver`, `plan`, `apply`, `Change`, `Report` |
 | `constraint.rs` | Parse and match Composer constraints; parse tags into versions; default constraint. | `Constraint`, `satisfies`, `parse_version`, `default_for` |
 | `manifest.rs` | Types and I/O for `aip.json` and `aip.lock`; Composer-style JSON writer that skips unchanged files. | `Manifest`, `Lock`, `LockedPackage`, `Source`, `write_json` |
-| `registry/mod.rs` | `Registry` trait, `RegistryConfig`, priority merge, name validation, `SKILL.md` description reader. | `Registry`, `RegistryConfig`, `Registries`, `valid_name`, `split_package`, `description` |
+| `registry/mod.rs` | `Registry` trait, `RegistryConfig`, priority merge, name validation and derivation from URLs, `SKILL.md` description reader. | `Registry`, `RegistryConfig`, `Registries`, `valid_name`, `valid_repository_name`, `derive_name`, `split_package`, `description` |
 | `registry/json.rs` | Registry stored as a JSON document, read from a file or downloaded; validates entries, resolves relative local URLs of file registries, allows only remote git URLs in downloaded ones. For URLs: conditional request, cache write after validation, fallback to the cached copy. | `JsonRegistry`, `JsonSource` |
 | `registry/cache.rs` | On-disk copy of downloaded registry documents: one JSON file per URL, atomic write, age text. Never holds credentials. | `CacheEntry`, `load`, `store`, `describe_age` |
 | `auth.rs` | Reads `AIP_AUTH` and `auth.json` files, merges them per host, picks the credential for a URL, applies the https policy, builds the `Authorization` value. Redacts secrets in `Debug` and errors. | `Auth`, `Credential`, `host_key` |
@@ -73,9 +73,10 @@ Every module also uses `Error`, `Result` and `Context` from `lib.rs`; those arro
 
 ## Registry abstraction
 
-Today a registry maps repository names to git URLs, nothing more.
+Today a registry maps git URLs to repository names, nothing more.
+The name is optional in the registry document and derived from the URL (`owner/repo`) when absent ([ADR 0010](../decisions/0010-repository-names-from-urls.md)).
 There are two types: `json` (a file or a URL with many repositories) and `git` (one repository declared inline in `aip.json`).
-Both share `validated_entry`: name check, credential guard, relative path resolution.
+Both share `validated_entry`: name check, credential guard, relative path resolution, name derivation.
 A `json` registry reads its text from a file or from `http::get`; parsing and validation are shared.
 For a URL it also uses the `RegistryContext` that `Project::registries` builds once: the cache folder and the `Auth`.
 The config takes exactly one of `path` and `url`, checked when `aip.json` is parsed.
@@ -143,7 +144,7 @@ classDiagram
 This is how a server registry would be added; none of it exists yet. `http::get` already exists for it.
 
 1. Add a variant to `RegistryConfig`, for example `Http { url: String }`. The serde tag turns it into `{ "type": "http", "url": "https://..." }` in `aip.json`. `deny_unknown_fields` and the `lowercase` rename already apply.
-2. Add `registry/http.rs` with a struct that implements `Registry`. `location()` returns the URL for messages. `repositories()` fetches a JSON list and returns `Entry { name, url }` values. It must apply the same checks as `JsonRegistry`: `valid_name`, no duplicates, no unknown keys.
+2. Add `registry/http.rs` with a struct that implements `Registry`. `location()` returns the URL for messages. `repositories()` fetches a JSON list and returns `Entry { name, url }` values. It must apply the same checks as `JsonRegistry`: `valid_repository_name`, `derive_name` for missing names, no duplicates, no unknown keys.
 3. Add the match arm in `RegistryConfig::open`.
 4. Reuse `http::get` (blocking ureq client, [ADR 0008](../decisions/0008-http-client-ureq.md)).
 

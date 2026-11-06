@@ -1,12 +1,13 @@
 //! A registry stored as a JSON document, read from a local file or downloaded over HTTP(S).
 //!
 //! ```json
-//! { "repositories": [ { "name": "anthropic", "url": "https://github.com/anthropics/skills.git" } ] }
+//! { "repositories": [ { "url": "https://github.com/anthropics/skills.git" } ] }
 //! ```
 
 use super::cache::{self, CacheEntry};
 use super::{
-    Entry, Registry, RegistryContext, check_no_credentials, is_remote_git_url, validated_entry,
+    Entry, Listing, RawEntry, Registry, RegistryContext, check_entry, check_no_credentials,
+    is_remote_git_url,
 };
 use crate::http::{self, Request, Response};
 use crate::{Context, Error, Result};
@@ -21,7 +22,7 @@ const MAX_REGISTRY_BYTES: u64 = 10_000_000;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    repositories: Vec<Entry>,
+    repositories: Vec<RawEntry>,
 }
 
 /// Where a `json` registry is configured to come from: exactly one of `path` or `url`.
@@ -97,7 +98,7 @@ impl JsonRegistry {
     /// Registry read from the file at `path`.
     pub fn file(path: PathBuf) -> Self {
         Self {
-            source: Source::File(path),
+            source: Source::File(super::normalize(&path)),
         }
     }
 
@@ -105,7 +106,7 @@ impl JsonRegistry {
     /// cache and credentials in `ctx`.
     pub fn new(source: &JsonSource, base: &Path, ctx: &RegistryContext) -> Self {
         let source = match source {
-            JsonSource::Path(path) => Source::File(base.join(path)),
+            JsonSource::Path(path) => Source::File(super::normalize(&base.join(path))),
             JsonSource::Url(url) => Source::Url {
                 url: url.clone(),
                 ctx: ctx.clone(),
@@ -115,7 +116,7 @@ impl JsonRegistry {
     }
 
     /// Reads and checks the document; a URL is revalidated against its cached copy.
-    fn load(&self) -> Result<Vec<Entry>> {
+    fn load(&self) -> Result<Listing> {
         match &self.source {
             Source::File(path) => self.parse(&read_file(path)?),
             Source::Url { url, ctx } => {
@@ -131,7 +132,7 @@ impl JsonRegistry {
     /// document is used and its `fetched_at` refreshed, so the age in the offline warning
     /// counts from the last time the server confirmed it. Unreachable server or 5xx: the
     /// cached copy stands in with a warning. Any 4xx is an error, to not hide auth or URL problems.
-    fn load_url(&self, url: &str, ctx: &RegistryContext) -> Result<Vec<Entry>> {
+    fn load_url(&self, url: &str, ctx: &RegistryContext) -> Result<Listing> {
         let cached = cache::load(&ctx.cache_dir, url);
         let credential = ctx.auth.credential_for(url)?;
         let request = Request {
@@ -183,44 +184,25 @@ impl JsonRegistry {
         }
     }
 
-    /// Parses and validates a registry document.
-    fn parse(&self, text: &str) -> Result<Vec<Entry>> {
-        let location = self.location();
-        let file: File =
-            serde_json::from_str(text).context(|| format!("invalid registry {location}"))?;
-        let mut entries: Vec<Entry> = Vec::new();
-        for entry in file.repositories {
-            let entry = self.validated(entry)?;
-            if entries.iter().any(|e| e.name == entry.name) {
-                return Err(Error::new(format!(
-                    "duplicate repository name '{}' in registry {location}",
-                    entry.name
-                )));
-            }
-            entries.push(entry);
-        }
-        Ok(entries)
+    /// Parses a registry document; invalid entries are recorded, not fatal.
+    fn parse(&self, text: &str) -> Result<Listing> {
+        let file: File = serde_json::from_str(text).context(|| "invalid JSON".to_string())?;
+        Ok(Listing::collect(file.repositories, |raw| {
+            self.validated(raw)
+        }))
     }
 
     /// Checks one entry; remote registries may only list remote git URLs, file registries
     /// resolve relative local URLs against the file's folder.
-    fn validated(&self, entry: Entry) -> Result<Entry> {
-        let location = self.location();
+    fn validated(&self, raw: &RawEntry) -> std::result::Result<Entry, String> {
         match &self.source {
-            Source::File(path) => {
-                let base = path.parent().unwrap_or(Path::new(""));
-                validated_entry(entry, base, &location)
-            }
+            Source::File(path) => check_entry(raw, path.parent().unwrap_or(Path::new(""))),
             Source::Url { .. } => {
-                if !is_remote_git_url(&entry.url) {
-                    check_no_credentials(&entry.url)
-                        .context(|| format!("repository '{}' in {location}", entry.name))?;
-                    return Err(Error::new(format!(
-                        "repository '{}' in registry {location}: a remote registry may only list remote git URLs",
-                        entry.name
-                    )));
+                if !is_remote_git_url(&raw.url) {
+                    check_no_credentials(&raw.url).map_err(|e| e.to_string())?;
+                    return Err("a remote registry may only list remote git URLs".to_string());
                 }
-                validated_entry(entry, Path::new(""), &location)
+                check_entry(raw, Path::new(""))
             }
         }
     }
@@ -234,7 +216,7 @@ impl Registry for JsonRegistry {
         }
     }
 
-    fn repositories(&self) -> Result<Vec<Entry>> {
+    fn listing(&self) -> Result<Listing> {
         self.load()
     }
 }
@@ -254,7 +236,7 @@ fn offline_warning(url: &str, reason: &str, age_seconds: u64) -> String {
 fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => Error::new(format!(
-            "registry not found at {} (create it with {{\"repositories\": [{{\"name\": \"<name>\", \"url\": \"<git url>\"}}]}} or list registries under \"registries\" in aip.json)",
+            "registry not found at {} (create it with {{\"repositories\": [{{\"url\": \"<git url>\"}}]}} or list registries under \"registries\" in aip.json)",
             path.display()
         )),
         _ => Error::new(format!("cannot read registry {}: {e}", path.display())),
@@ -369,7 +351,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "repository 'demo' in registry {url}: a remote registry may only list remote git URLs"
+                    "repository 'demo' in {url}: a remote registry may only list remote git URLs"
                 )
             );
         }
@@ -528,6 +510,13 @@ mod tests {
     }
 
     #[test]
+    fn file_location_is_normalized() {
+        let source = JsonSource::Path("../x/./reg.json".into());
+        let reg = JsonRegistry::new(&source, Path::new("/a/b"), &context(Auth::none()));
+        assert_eq!(reg.location(), "/a/x/reg.json");
+    }
+
+    #[test]
     fn invalid_download_keeps_the_good_cache() {
         let ctx = context(Auth::none());
         let url = serve("200 OK", "not json");
@@ -540,7 +529,7 @@ mod tests {
         };
         cache::store(&ctx.cache_dir, &good).unwrap();
         let err = open(&url, &ctx).repositories().unwrap_err().to_string();
-        assert!(err.starts_with("invalid registry"), "{err}");
+        assert!(err.starts_with("invalid JSON"), "{err}");
         assert_eq!(cache::load(&ctx.cache_dir, &url), Some(good));
     }
 

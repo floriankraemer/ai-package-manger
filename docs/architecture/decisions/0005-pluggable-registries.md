@@ -30,7 +30,7 @@ Use option 2.
 - `RegistryConfig` is a serde enum tagged by `type`; today only `json` with a `path`. Unknown types fail to parse with an error that names the variant.
 - `Registries` merges the list. For duplicate names the first registry wins, like Composer repository priority. Later registries still add their other names.
 - `aip.json` `registries` replaces the default `$AIP_HOME/registry.json`. It does not add to it.
-- A package name is `<repository name>/<skill>`, where the name comes from the registry, not from the URL.
+- A package name is `<repository name>/<skill>`, where the name is derived from the URL or set in the registry (amended by [0010](0010-repository-names-from-urls.md)).
 - Inside one registry, duplicate names are an error.
 - Relative local URLs and paths resolve against the registry file or `aip.json`.
 

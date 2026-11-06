@@ -20,13 +20,13 @@ flowchart LR
 ```
 
 The user (or a CI job) runs `aip`.
-aip reads the registries to learn repository names and URLs, fetches those repositories from their git remotes, and copies skill folders into the folders the AI harnesses read.
+aip reads the registries to learn repository URLs (and names, derived from the URLs unless set), fetches those repositories from their git remotes, and copies skill folders into the folders the AI harnesses read.
 The harnesses themselves are not called; aip only writes files they pick up.
 
 | Partner | Direction | Content |
 |---|---|---|
 | User | in | Command line, `aip.json` edits |
-| Registry file | in | `{"repositories": [{"name", "url"}]}` |
+| Registry file | in | `{"repositories": [{"url", "name"?}]}` |
 | Git remote | in | Repository objects (tags, branches, `skills/<skill>/...`) |
 | Harness skill folder | out | Skill folder per package |
 | `aip.json`, `aip.lock` | in and out | Requirements and resolved state |
@@ -38,7 +38,7 @@ The harnesses themselves are not called; aip only writes files they pick up.
 | Command line | `clap`, exit code 0 or 1, errors as `error: <message>` on stderr |
 | Git | `git` child processes (`clone --mirror`, `fetch --prune`, `ls-tree`, `cat-file`, `rev-parse`, `for-each-ref`, `symbolic-ref`) |
 | Registry | JSON file on disk |
-| Configuration | `AIP_HOME`; `HOME`/`USERPROFILE`; `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for `detect --global` only |
+| Configuration | `AIP_HOME`; `HOME`/`USERPROFILE`; `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for `detect --global` and the global skill folders (`--global` installs) |
 
 ## Out of scope
 

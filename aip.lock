@@ -5,7 +5,7 @@
     ],
     "packages": [
         {
-            "name": "floriankraemer/symfony",
+            "name": "floriankraemer/claude-ai/symfony",
             "version": "dev-master",
             "description": "Use when writing or reviewing Symfony framework code — controllers, Doctrine, DI, security component, forms/validation, and performance. Trigger on \"write Symfony\", \"review this Symfony code\", \"Symfony best practice\", \"API Platform\", or before/after implementing Symfony backend features. Pair with php for language-level conventions and security-audit-php-application for security-specific review.",
             "source": {

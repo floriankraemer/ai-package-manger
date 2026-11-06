@@ -10,11 +10,11 @@ Purpose: terms as used in the code and the docs.
 | Provider | Entry in `PROVIDERS` (`detect.rs`): id, name, detection markers, optional skill folders, optional env variable. |
 | Marker | A file or folder whose existence signals a provider, e.g. `.claude/` or `CLAUDE.md`. |
 | Scope | `Project` (current directory) or `Global` (home folder, manifest in `$AIP_HOME`). |
-| Repository | A git repository listed in a registry under a short name. |
-| Registry | An ordered source of repository entries (`name`, `url`). Trait `Registry`. |
+| Repository | A git repository listed in a registry. Its name is `<owner>/<repo>`, derived from the URL unless the entry sets `name`. |
+| Registry | An ordered source of repository entries (`url`, optional `name`). Trait `Registry`. |
 | `RegistryConfig` | The `registries` entry in `aip.json`, a tagged enum (`type`). |
 | `Registries` | The merged, prioritised set of registries used during a run. |
-| Package name | `<repository>/<skill>`. |
+| Package name | `<repository>/<skill>`, for example `anthropics/skills/pdf`. |
 | Manifest | `aip.json`. The `Manifest` type. |
 | Lock | `aip.lock`. The `Lock` type with `LockedPackage` and `Source`. |
 | Constraint | A version requirement string in Composer notation, or `dev-<branch>`. |
