@@ -1,5 +1,5 @@
 use aip::detect::{self, Detection, Scope};
-use aip::ops::{self, Project, Report, SearchHit, SkillStatus, Status};
+use aip::ops::{self, Options, Project, Report, SearchHit, SkillStatus, Status};
 use aip::table::{self, Cell, Color};
 use clap::{Parser, Subcommand};
 use std::env;
@@ -47,6 +47,9 @@ enum Command {
     Search {
         /// Text to look for (case-insensitive)
         query: String,
+        /// Use the registries of the global aip.json in $AIP_HOME
+        #[arg(short, long)]
+        global: bool,
         /// Print results as JSON
         #[arg(long)]
         json: bool,
@@ -55,22 +58,31 @@ enum Command {
     Info {
         /// Skill as <repository>/<skill>
         name: String,
+        /// Use the registries of the global aip.json in $AIP_HOME
+        #[arg(short, long)]
+        global: bool,
         /// Print result as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show installed skills and whether newer versions are available
+    #[command(
+        after_help = "Exit status: 1 if a skill has an error; with --strict, also if any skill is not up to date."
+    )]
     Check {
         /// Use the global aip.json in $AIP_HOME and check your home folder
         #[arg(short, long)]
         global: bool,
+        /// Exit with status 1 unless every skill is up to date (for CI)
+        #[arg(long)]
+        strict: bool,
         /// Print results as JSON
         #[arg(long)]
         json: bool,
     },
     /// Add skills to aip.json and install everything locked in aip.lock
     #[command(
-        after_help = "Examples:\n  aip install anthropic/pdf\n  aip install anthropic/pdf:^1.2 anthropic/xlsx:dev-main\n  aip install            # install from aip.lock"
+        after_help = "Examples:\n  aip install anthropics/skills/pdf\n  aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main\n  aip install            # install from aip.lock"
     )]
     Install {
         /// Skills to add, as <repository>/<skill>[:<constraint>]
@@ -81,6 +93,9 @@ enum Command {
         /// Replace skill folders that were not installed by aip
         #[arg(long)]
         force: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Update skills to the newest versions allowed by aip.json
     Update {
@@ -92,6 +107,9 @@ enum Command {
         /// Replace skill folders that were not installed by aip
         #[arg(long)]
         force: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove skills from aip.json and delete their folders
     Remove {
@@ -101,34 +119,70 @@ enum Command {
         /// Use the global aip.json in $AIP_HOME and remove from your home folder
         #[arg(short, long)]
         global: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
 fn main() -> ExitCode {
+    let mut code = ExitCode::SUCCESS;
     let result = match Cli::parse().command {
         Command::Detect { path, global, json } => run_detect(path, global, json),
         Command::Init { providers, global } => {
             project(global).and_then(|p| run_init(&p, providers))
         }
-        Command::Search { query, json } => run_search(&query, json),
-        Command::Info { name, json } => run_info(&name, json),
-        Command::Check { global, json } => project(global).and_then(|p| run_check(&p, json)),
+        Command::Search {
+            query,
+            global,
+            json,
+        } => project(global).and_then(|p| run_search(&p, &query, json)),
+        Command::Info { name, global, json } => {
+            project(global).and_then(|p| run_info(&p, &name, json))
+        }
+        Command::Check {
+            global,
+            strict,
+            json,
+        } => project(global)
+            .and_then(|p| run_check(&p, json))
+            .map(|rows| {
+                if check_failed(&rows, strict) {
+                    code = ExitCode::FAILURE;
+                }
+            }),
         Command::Install {
             packages,
             global,
             force,
-        } => project(global).and_then(|p| show(&p, ops::install(&p, &packages, force)?)),
+            dry_run,
+        } => project(global).and_then(|p| {
+            let options = Options { force, dry_run };
+            show(&p, ops::install(&p, &packages, options)?, dry_run)
+        }),
         Command::Update {
             packages,
             global,
             force,
-        } => project(global).and_then(|p| show(&p, ops::update(&p, &packages, force)?)),
-        Command::Remove { packages, global } => {
-            project(global).and_then(|p| show(&p, ops::remove(&p, &packages)?))
-        }
+            dry_run,
+        } => project(global).and_then(|p| {
+            let options = Options { force, dry_run };
+            show(&p, ops::update(&p, &packages, options)?, dry_run)
+        }),
+        Command::Remove {
+            packages,
+            global,
+            dry_run,
+        } => project(global).and_then(|p| {
+            let options = Options {
+                force: false,
+                dry_run,
+            };
+            show(&p, ops::remove(&p, &packages, options)?, dry_run)
+        }),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => code,
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
@@ -148,15 +202,22 @@ fn project(global: bool) -> aip::Result<Project> {
     Ok(Project::local(cwd, aip_home))
 }
 
-fn show(project: &Project, report: Report) -> aip::Result<()> {
-    if report.changes.is_empty() {
+fn show(project: &Project, report: Report, dry_run: bool) -> aip::Result<()> {
+    if dry_run {
+        println!("Dry run: nothing was changed.");
+    }
+    if report.changes.is_empty() && report.pruned.is_empty() {
         println!("Nothing to install, update or remove");
         return Ok(());
     }
+    let shown = |dir: &Path| match project.scope {
+        Scope::Project => relative(dir, &project.root),
+        Scope::Global => format!("~{}{}", path::MAIN_SEPARATOR, relative(dir, &project.root)),
+    };
     let count = |pred: fn(&ops::Change) -> bool| report.changes.iter().filter(|c| pred(c)).count();
     let installs = count(|c| matches!(c, ops::Change::Install { .. }));
     let updates = count(|c| matches!(c, ops::Change::Update { .. }));
-    let removals = count(|c| matches!(c, ops::Change::Remove { .. }));
+    let removals = count(|c| matches!(c, ops::Change::Remove { .. })) + report.pruned.len();
     println!(
         "Package operations: {installs} install{}, {updates} update{}, {removals} removal{}",
         plural(installs),
@@ -166,14 +227,10 @@ fn show(project: &Project, report: Report) -> aip::Result<()> {
     for change in &report.changes {
         println!("  - {change}");
     }
-    let targets: Vec<_> = report
-        .targets
-        .iter()
-        .map(|t| match project.scope {
-            Scope::Project => relative(t, &project.root),
-            Scope::Global => format!("~{}{}", path::MAIN_SEPARATOR, relative(t, &project.root)),
-        })
-        .collect();
+    for (name, dir) in &report.pruned {
+        println!("  - Removing {name} from {}", shown(dir));
+    }
+    let targets: Vec<_> = report.targets.iter().map(|t| shown(t)).collect();
     println!("Skill folders: {}", targets.join(", "));
     Ok(())
 }
@@ -186,18 +243,33 @@ fn run_init(project: &Project, providers: Vec<String>) -> aip::Result<()> {
     Ok(())
 }
 
-fn run_check(project: &Project, json: bool) -> aip::Result<()> {
+/// Prints the check report and returns the rows for the exit status.
+fn run_check(project: &Project, json: bool) -> aip::Result<Vec<SkillStatus>> {
     let rows = ops::check(project)?;
+    print_check(&rows, json);
+    Ok(rows)
+}
+
+/// `aip check` fails on any error row; `--strict` also on anything not up to date.
+fn check_failed(rows: &[SkillStatus], strict: bool) -> bool {
+    rows.iter().any(|r| match r.status {
+        Status::UpToDate => false,
+        Status::Error { .. } => true,
+        _ => strict,
+    })
+}
+
+fn print_check(rows: &[SkillStatus], json: bool) {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&rows).expect("skill statuses serialize")
+            serde_json::to_string_pretty(rows).expect("skill statuses serialize")
         );
-        return Ok(());
+        return;
     }
     if rows.is_empty() {
         println!("No skills required in aip.json.");
-        return Ok(());
+        return;
     }
     let color = use_color();
     let cells: Vec<Vec<Cell>> = rows
@@ -215,10 +287,9 @@ fn run_check(project: &Project, json: bool) -> aip::Result<()> {
         .collect();
     let headers = ["Package", "Installed", "Constraint", "Latest", "Status"];
     println!("{}", table::render_table(&headers, &cells));
-    for line in check_hints(&rows) {
+    for line in check_hints(rows) {
         println!("{line}");
     }
-    Ok(())
 }
 
 /// Color only for terminals, and not when `NO_COLOR` is set (https://no-color.org).
@@ -254,7 +325,9 @@ fn check_hints(rows: &[SkillStatus]) -> Vec<String> {
             .map(|r| r.name.as_str())
             .collect()
     };
-    let missing = names(|s| matches!(s, Status::NotInstalled | Status::FolderMissing));
+    // `install` refuses requirements the lock lacks, so those need `update`.
+    let unlocked = names(|s| matches!(s, Status::NotInstalled));
+    let missing = names(|s| matches!(s, Status::FolderMissing | Status::FolderOutdated));
     let updates = names(|s| {
         matches!(
             s,
@@ -272,8 +345,14 @@ fn check_hints(rows: &[SkillStatus]) -> Vec<String> {
                 }
         )
     });
+    if !unlocked.is_empty() {
+        lines.push(format!(
+            "Run `aip update {}` to resolve skills missing from aip.lock.",
+            unlocked.join(" ")
+        ));
+    }
     if !missing.is_empty() {
-        lines.push("Run `aip install` to install missing skills.".into());
+        lines.push("Run `aip install` to install missing or out-of-date skills.".into());
     }
     if !updates.is_empty() {
         lines.push(format!(
@@ -300,8 +379,8 @@ fn check_hints(rows: &[SkillStatus]) -> Vec<String> {
     lines
 }
 
-fn run_search(query: &str, json: bool) -> aip::Result<()> {
-    let hits = ops::search(&project(false)?, query)?;
+fn run_search(project: &Project, query: &str, json: bool) -> aip::Result<()> {
+    let hits = ops::search(project, query)?;
     if json {
         println!(
             "{}",
@@ -331,11 +410,8 @@ fn run_search(query: &str, json: bool) -> aip::Result<()> {
     Ok(())
 }
 
-fn run_info(name: &str, json: bool) -> aip::Result<()> {
-    let hit = ops::search(&project(false)?, name)?
-        .into_iter()
-        .find(|h| h.name == name)
-        .ok_or_else(|| aip::Error::new(format!("skill '{name}' not found in the registry")))?;
+fn run_info(project: &Project, name: &str, json: bool) -> aip::Result<()> {
+    let hit = ops::info(project, name)?;
     if json {
         println!(
             "{}",
@@ -455,6 +531,45 @@ mod tests {
         let s = summarize(&long);
         assert!(s.chars().count() <= SUMMARY_WIDTH);
         assert!(s.ends_with('…'));
+    }
+
+    fn row(name: &str, status: Status) -> SkillStatus {
+        SkillStatus {
+            name: name.into(),
+            constraint: "*".into(),
+            installed: None,
+            latest: None,
+            status,
+        }
+    }
+
+    #[test]
+    fn hints_send_unlocked_skills_to_update() {
+        let rows = [
+            row("a/x", Status::NotInstalled),
+            row("a/y", Status::FolderMissing),
+        ];
+        let hints = check_hints(&rows);
+        assert!(hints.contains(
+            &"Run `aip update a/x` to resolve skills missing from aip.lock.".to_string()
+        ));
+        assert!(
+            hints.contains(
+                &"Run `aip install` to install missing or out-of-date skills.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn check_exit_status() {
+        let error = Status::Error {
+            message: "boom".into(),
+        };
+        let stale = Status::FolderMissing;
+        assert!(check_failed(&[row("a/x", error)], false));
+        assert!(!check_failed(&[row("a/x", stale.clone())], false));
+        assert!(check_failed(&[row("a/x", stale)], true));
+        assert!(!check_failed(&[row("a/x", Status::UpToDate)], true));
     }
 
     #[test]

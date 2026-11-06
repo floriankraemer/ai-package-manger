@@ -13,5 +13,6 @@ Purpose: index of architecture decision records (ADRs) in [`../decisions/`](../d
 | [0007](../decisions/0007-authentication-delegated-to-git.md) | Authentication delegated to git | Accepted | 2026-11-05 |
 | [0008](../decisions/0008-http-client-ureq.md) | HTTP client: ureq with rustls (ring) | Accepted | 2026-11-05 |
 | [0009](../decisions/0009-auth-json-for-http-registries.md) | auth.json for HTTP registries | Accepted | 2026-11-05 |
+| [0010](../decisions/0010-repository-names-from-urls.md) | Repository names derived from URLs | Accepted | 2026-11-06 |
 
 Write new ADRs as `NNNN-short-title.md` in MADR style, and add them to this table.

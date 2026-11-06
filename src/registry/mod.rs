@@ -17,11 +17,29 @@ use std::cell::OnceCell;
 use std::path::{self, Component, Path, PathBuf};
 
 /// A repository listed in a registry.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
     pub url: String,
+}
+
+/// A repository as written in a registry: `name` is optional and derived from the URL when absent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub url: String,
+}
+
+impl RawEntry {
+    /// Names the entry in error messages without echoing the URL.
+    pub(crate) fn label(&self) -> String {
+        match &self.name {
+            Some(name) => format!("repository '{name}'"),
+            None => "repository".to_string(),
+        }
+    }
 }
 
 /// A source of skill repositories (JSON file or URL now; HTTP server later).
@@ -48,7 +66,11 @@ pub enum RegistryConfig {
     /// Registry document from a file (`path`) or a URL (`url`).
     Json(JsonSource),
     /// One repository declared inline.
-    Git { name: String, url: String },
+    Git {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        url: String,
+    },
 }
 
 impl RegistryConfig {
@@ -82,16 +104,28 @@ impl Registries {
 
     /// The repository called `name`, from the first registry that lists it.
     pub fn get(&self, name: &str) -> Result<Entry> {
-        self.entries()?
-            .into_iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| {
-                let locations: Vec<_> = self.registries.iter().map(|r| r.location()).collect();
-                Error::new(format!(
-                    "unknown repository '{name}' (not listed in any registry: {})",
-                    locations.join(", ")
-                ))
+        let entries = self.entries()?;
+        if let Some(entry) = entries.iter().find(|e| e.name == name) {
+            return Ok(entry.clone());
+        }
+        let locations: Vec<_> = self.registries.iter().map(|r| r.location()).collect();
+        let similar: Vec<String> = entries
+            .iter()
+            .filter(|e| {
+                e.name.ends_with(&format!("/{name}")) || e.name.starts_with(&format!("{name}/"))
             })
+            .take(3)
+            .map(|e| format!("'{}'", e.name))
+            .collect();
+        let hint = if similar.is_empty() {
+            String::new()
+        } else {
+            format!("; did you mean {}?", similar.join(", "))
+        };
+        Err(Error::new(format!(
+            "unknown repository '{name}' (not listed in any registry: {}){hint}",
+            locations.join(", ")
+        )))
     }
 
     /// All repositories, first registry wins on duplicate names.
@@ -112,26 +146,88 @@ impl Registries {
 }
 
 /// Repository and skill names become directory names, so they are restricted to a safe set.
+///
+/// Names Windows cannot create (`con`, `nul.txt`, trailing `.`) are refused on every platform, so
+/// a lock built on Linux also works on Windows.
 pub fn valid_name(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+    !name.ends_with('.')
+        && !is_reserved_device_name(name)
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
 }
 
-/// Checks a registry entry (name, no credentials in the URL) and resolves a relative local URL
-/// against `base`. `location` names the registry in error messages.
-pub(crate) fn validated_entry(mut entry: Entry, base: &Path, location: &str) -> Result<Entry> {
-    if !valid_name(&entry.name) {
+/// Windows device names (`CON`, `nul.txt`, `COM1`, ...), which cannot be files there, with or
+/// without extension, in any case.
+pub(crate) fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|c: char| ('1'..='9').contains(&c)))
+}
+
+/// Repository names are `/`-separated paths such as `owner/repo`; each segment is a [`valid_name`].
+pub fn valid_repository_name(name: &str) -> bool {
+    name.split('/').all(valid_name)
+}
+
+/// Derives `<owner>/<repo>` (the full lowercase URL path) from a git URL or local path.
+///
+/// Local paths yield their final component; Azure DevOps `_git` and `v3` segments are dropped.
+pub fn derive_name(url: &str) -> Result<String> {
+    let (host, path) = if is_local(url) {
+        ("", url.rsplit(['/', '\\']).next().unwrap_or(""))
+    } else {
+        let (host_part, path) = match url.split_once("://") {
+            Some((_, rest)) => rest.split_once('/').unwrap_or((rest, "")),
+            None => url.split_once(':').unwrap_or((url, "")),
+        };
+        let host = host_part.rsplit('@').next().unwrap_or("");
+        (host, path.split(['?', '#']).next().unwrap_or(""))
+    };
+    let azure = host.to_ascii_lowercase().ends_with("dev.azure.com");
+    let lower = path.to_ascii_lowercase();
+    let mut segments: Vec<&str> = lower
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "_git")
+        .collect();
+    if azure && segments.first() == Some(&"v3") {
+        segments.remove(0);
+    }
+    if let Some(last) = segments.last_mut() {
+        *last = last.strip_suffix(".git").unwrap_or(last);
+    }
+    if segments.is_empty() || !segments.iter().all(|s| valid_name(s)) {
         return Err(Error::new(format!(
-            "invalid repository name '{}' in registry {location} (use lowercase letters, digits, '.', '_', '-')",
-            entry.name
+            "cannot derive a repository name from {url}; set \"name\" (lowercase letters, digits, '.', '_', '-', segments separated by '/')"
         )));
     }
-    check_no_credentials(&entry.url)
-        .context(|| format!("repository '{}' in {location}", entry.name))?;
-    entry.url = resolve_url(&entry.url, base)?;
-    Ok(entry)
+    Ok(segments.join("/"))
+}
+
+/// Checks a registry entry (name, no credentials in the URL), resolves a relative local URL
+/// against `base` and derives a missing name from the URL. `location` names the registry in
+/// error messages.
+pub(crate) fn validated_entry(raw: RawEntry, base: &Path, location: &str) -> Result<Entry> {
+    if let Some(name) = raw.name.as_deref().filter(|n| !valid_repository_name(n)) {
+        return Err(Error::new(format!(
+            "invalid repository name '{name}' in registry {location} (use lowercase letters, digits, '.', '_', '-', segments separated by '/')"
+        )));
+    }
+    // The URL reaches `git config` as a value; a leading '-' must never look like an option.
+    if raw.url.starts_with('-') {
+        return Err(Error::new("URL must not start with '-'"))
+            .context(|| format!("{} in {location}", raw.label()));
+    }
+    check_no_credentials(&raw.url).context(|| format!("{} in {location}", raw.label()))?;
+    let url = resolve_url(&raw.url, base)?;
+    let name = match raw.name {
+        Some(name) => name,
+        None => derive_name(&url).context(|| format!("repository in {location}"))?,
+    };
+    Ok(Entry { name, url })
 }
 
 /// Makes a relative local URL absolute against `base`; remote URLs are returned unchanged.
@@ -141,6 +237,41 @@ pub(crate) fn resolve_url(url: &str, base: &Path) -> Result<String> {
     }
     let local = path::absolute(base.join(url)).context(|| format!("cannot resolve {url}"))?;
     Ok(normalize(&local).to_string_lossy().into_owned())
+}
+
+/// The URL as aip.lock stores it: an absolute local path becomes relative to `base` (an absolute,
+/// normalized folder) with `/` separators when a relative path exists, so teammates can use the
+/// lock from another location. Everything else is kept.
+pub(crate) fn portable_url(url: &str, base: &Path) -> String {
+    if is_local(url) && Path::new(url).is_absolute() {
+        relative_path(base, Path::new(url)).unwrap_or_else(|| url.to_string())
+    } else {
+        url.to_string()
+    }
+}
+
+/// Path from folder `from_dir` to `to`, written with `/` separators (`.` if equal). `None` when
+/// there is none, e.g. different Windows drives or a relative path against an absolute one.
+pub(crate) fn relative_path(from_dir: &Path, to: &Path) -> Option<String> {
+    let (from, to) = (normalize(from_dir), normalize(to));
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return None;
+    }
+    let parts: Vec<String> = std::iter::repeat_n("..".to_string(), from.len() - common)
+        .chain(
+            to[common..]
+                .iter()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+        )
+        .collect();
+    Some(if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    })
 }
 
 /// Rejects credentials in a URL: aip copies URLs into aip.json and aip.lock, which get committed.
@@ -166,11 +297,11 @@ pub(crate) fn check_no_credentials(url: &str) -> Result<()> {
 
 /// Splits `<repository>/<skill>` and validates both parts.
 pub fn split_package(name: &str) -> Result<(&str, &str)> {
-    name.split_once('/')
-        .filter(|(repo, skill)| valid_name(repo) && valid_name(skill))
+    name.rsplit_once('/')
+        .filter(|(repo, skill)| valid_repository_name(repo) && valid_name(skill))
         .ok_or_else(|| {
             Error::new(format!(
-                "invalid package name '{name}' (expected <repository>/<skill> using lowercase letters, digits, '.', '_', '-')"
+                "invalid package name '{name}' (expected <repository>/<skill>, e.g. owner/repo/skill, using lowercase letters, digits, '.', '_', '-')"
             ))
         })
 }
@@ -185,7 +316,16 @@ pub fn description(skill_md: &str) -> Option<String> {
     lines
         .take_while(|l| l.trim() != "---")
         .find_map(|l| l.strip_prefix("description:"))
-        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        // Control characters would let a SKILL.md drive the terminal (ANSI/OSC) or corrupt aip.lock.
+        .map(|v| {
+            v.trim()
+                .trim_matches(['"', '\''])
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
         .filter(|v| !v.is_empty())
 }
 
@@ -235,7 +375,12 @@ mod tests {
         assert_eq!(split_package("a/pdf").unwrap(), ("a", "pdf"));
         assert!(split_package("pdf").is_err());
         assert!(split_package("a/../x").is_err());
-        assert!(split_package("a/b/c").is_err());
+        assert_eq!(split_package("a/b/c").unwrap(), ("a/b", "c"));
+        for bad in ["a//c", "/c", "a/", "a/../c"] {
+            assert!(split_package(bad).is_err(), "{bad}");
+        }
+        assert!(valid_repository_name("group/sub/repo"));
+        assert!(!valid_repository_name("a//b") && !valid_repository_name(""));
     }
 
     #[test]
@@ -243,6 +388,23 @@ mod tests {
         let md = "---\nname: pdf\ndescription: \"Work with PDFs\"\n---\n# PDF\ndescription: no";
         assert_eq!(description(md).as_deref(), Some("Work with PDFs"));
         assert_eq!(description("# no frontmatter"), None);
+    }
+
+    #[test]
+    fn description_strips_control_characters() {
+        let md = "---\ndescription: \x1b]52;c;xx\x07evil\r\n---\n";
+        assert_eq!(description(md).as_deref(), Some("]52;c;xx evil"));
+    }
+
+    #[test]
+    fn windows_unsafe_names_are_invalid() {
+        for bad in ["con", "nul.txt", "aux.tar.gz", "com1", "lpt9.x", "name."] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+        for ok in ["console", "com0", "com10", "lpt", "a.b", "nul-x"] {
+            assert!(valid_name(ok), "{ok}");
+        }
+        assert!(is_reserved_device_name("CoN") && is_reserved_device_name("Nul.TXT"));
     }
 
     #[test]
@@ -256,6 +418,46 @@ mod tests {
     }
 
     use std::fs;
+
+    #[test]
+    fn relative_paths() {
+        let rel = |from: &str, to: &str| relative_path(Path::new(from), Path::new(to));
+        assert_eq!(rel("/a/proj", "/a/repo").as_deref(), Some("../repo"));
+        assert_eq!(rel("/a/proj", "/a/proj/sub/x").as_deref(), Some("sub/x"));
+        assert_eq!(rel("/a/b/proj", "/a/repo").as_deref(), Some("../../repo"));
+        assert_eq!(rel("/a/proj", "/a/proj").as_deref(), Some("."));
+        assert_eq!(rel("/a/p/../q", "/a/./r").as_deref(), Some("../r"));
+        assert_eq!(rel("/a", "b"), None);
+        #[cfg(windows)]
+        {
+            assert_eq!(rel(r"C:\a\proj", r"C:\a\repo").as_deref(), Some("../repo"));
+            assert_eq!(rel(r"C:\a", r"D:\a"), None);
+        }
+    }
+
+    #[test]
+    fn portable_urls() {
+        let base = Path::new("/a/proj");
+        assert_eq!(portable_url("/a/my-skills", base), "../my-skills");
+        assert_eq!(portable_url("https://h/a/b.git", base), "https://h/a/b.git");
+        assert_eq!(portable_url("git@h:a/b.git", base), "git@h:a/b.git");
+        assert_eq!(portable_url("../already", base), "../already");
+    }
+
+    #[test]
+    fn urls_starting_with_dash_are_rejected_without_echo() {
+        let raw = RawEntry {
+            name: Some("x".into()),
+            url: "--upload-pack=evil".into(),
+        };
+        let err = validated_entry(raw, Path::new("."), "reg.json")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "repository 'x' in reg.json: URL must not start with '-'"
+        );
+    }
 
     fn no_context() -> RegistryContext {
         RegistryContext {
@@ -346,7 +548,7 @@ mod tests {
         );
         let inline = |name: &str, url: &str| {
             RegistryConfig::Git {
-                name: name.into(),
+                name: Some(name.into()),
                 url: url.into(),
             }
             .open(&dir, &no_context())
@@ -413,7 +615,7 @@ mod tests {
         assert_eq!(
             ok,
             RegistryConfig::Git {
-                name: "a".into(),
+                name: Some("a".into()),
                 url: "u".into()
             }
         );
@@ -423,5 +625,101 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unknown field `branch`"), "{err}");
+    }
+
+    #[test]
+    fn derives_names() {
+        for (url, want) in [
+            (
+                "https://github.com/anthropics/skills.git",
+                "anthropics/skills",
+            ),
+            (
+                "git@github.com:FlorianKraemer/claude-ai.git",
+                "floriankraemer/claude-ai",
+            ),
+            (
+                "ssh://git@gitlab.com:2222/group/sub/repo.git",
+                "group/sub/repo",
+            ),
+            ("https://gitlab.com/group/sub/repo/", "group/sub/repo"),
+            ("https://dev.azure.com/org/proj/_git/repo", "org/proj/repo"),
+            ("git@ssh.dev.azure.com:v3/org/proj/repo", "org/proj/repo"),
+            ("https://github.com/a/b?x=1#f", "a/b"),
+            ("../my-skills", "my-skills"),
+            (r"C:\repos\skills.git", "skills"),
+        ] {
+            assert_eq!(derive_name(url).unwrap(), want, "{url}");
+        }
+        for bad in ["https://github.com/", "https://h/a b/c", "/"] {
+            let err = derive_name(bad).unwrap_err().to_string();
+            assert!(
+                err.starts_with("cannot derive a repository name from"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_without_name_derive_it() {
+        let dir = std::env::temp_dir().join(format!("aip-derived-{}", std::process::id()));
+        let json = json_registry(
+            &dir,
+            "d.json",
+            r#"{"repositories": [{"url": "https://github.com/anthropics/skills.git"}, {"url": "../local-repo"}, {"name": "x", "url": "https://h/y.git"}]}"#,
+        );
+        let names: Vec<_> = json
+            .repositories()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["anthropics/skills", "local-repo", "x"]);
+
+        let dup = json_registry(
+            &dir,
+            "dup.json",
+            r#"{"repositories": [{"url": "https://a/o/r.git"}, {"url": "git@b:o/r.git"}]}"#,
+        );
+        let err = dup.repositories().unwrap_err().to_string();
+        assert!(err.contains("duplicate repository name 'o/r'"), "{err}");
+
+        let registries = Registries::new(vec![json]);
+        let err = registries.get("skills").unwrap_err().to_string();
+        assert!(
+            err.ends_with("; did you mean 'anthropics/skills'?"),
+            "{err}"
+        );
+        assert!(
+            !registries
+                .get("zzz")
+                .unwrap_err()
+                .to_string()
+                .contains("did you mean")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_git_without_name() {
+        let cfg: RegistryConfig =
+            serde_json::from_str(r#"{"type": "git", "url": "git@github.com:Acme/Priv.git"}"#)
+                .unwrap();
+        assert_eq!(
+            cfg,
+            RegistryConfig::Git {
+                name: None,
+                url: "git@github.com:Acme/Priv.git".into()
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"type":"git","url":"git@github.com:Acme/Priv.git"}"#
+        );
+        let repos = cfg
+            .open(Path::new("."), &no_context())
+            .repositories()
+            .unwrap();
+        assert_eq!(repos[0].name, "acme/priv");
     }
 }

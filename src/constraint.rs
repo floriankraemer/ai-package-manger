@@ -11,9 +11,9 @@ pub enum Constraint {
     Branch(String),
     /// Version range: any alternative (`||`) whose comparators all match.
     Range {
-        alternatives: Vec<Vec<Comparator>>,
-        /// Pre-release versions only match when the constraint itself names one.
-        prerelease: bool,
+        /// Each alternative with its pre-release opt-in: pre-release versions only match an
+        /// alternative that itself names one.
+        alternatives: Vec<(Vec<Comparator>, bool)>,
     },
 }
 
@@ -34,6 +34,11 @@ pub struct Comparator {
 }
 
 impl Comparator {
+    /// Whether the user wrote a pre-release; the implicit `-0` upper bound does not count.
+    fn names_prerelease(&self) -> bool {
+        !self.version.pre.is_empty() && !(self.op == Op::Lt && self.version.pre.as_str() == "0")
+    }
+
     fn matches(&self, v: &Version) -> bool {
         let target = &self.version;
         match self.op {
@@ -64,34 +69,22 @@ impl Constraint {
                 None => and_list(alt),
             }
             .map_err(invalid)?;
-            alternatives.push(comparators);
+            let prerelease = comparators.iter().any(Comparator::names_prerelease);
+            alternatives.push((comparators, prerelease));
         }
         if alternatives.is_empty() {
             return Err(invalid("empty".into()));
         }
-        let prerelease = alternatives
-            .iter()
-            .flatten()
-            .any(|c| !c.version.pre.is_empty());
-        Ok(Self::Range {
-            alternatives,
-            prerelease,
-        })
+        Ok(Self::Range { alternatives })
     }
 
     /// Whether a tagged version satisfies this constraint. Branch constraints match no tag.
     pub fn matches(&self, v: &Version) -> bool {
         match self {
             Self::Branch(_) => false,
-            Self::Range {
-                alternatives,
-                prerelease,
-            } => {
-                (v.pre.is_empty() || *prerelease)
-                    && alternatives
-                        .iter()
-                        .any(|all| all.iter().all(|c| c.matches(v)))
-            }
+            Self::Range { alternatives } => alternatives.iter().any(|(all, prerelease)| {
+                (v.pre.is_empty() || *prerelease) && all.iter().all(|c| c.matches(v))
+            }),
         }
     }
 }
@@ -197,10 +190,12 @@ fn atom(token: &str) -> Result<Vec<Comparator>, String> {
         .iter()
         .find_map(|(sym, op)| token.strip_prefix(sym).map(|rest| (*op, rest)))
         .unwrap_or((Op::Eq, token));
-    Ok(vec![Comparator {
-        op,
-        version: Partial::parse(rest)?.floor(),
-    }])
+    let mut version = Partial::parse(rest)?.floor();
+    if op == Op::Lt && version.pre.is_empty() {
+        // Composer: `<2.0.0` means `<2.0.0-dev`, so it excludes `2.0.0-beta` too.
+        version.pre = Prerelease::new("0").expect("valid pre-release");
+    }
+    Ok(vec![Comparator { op, version }])
 }
 
 /// `1.0 - 2.0`: inclusive; a partial upper bound includes everything it prefixes (`< 2.1.0`).
@@ -243,8 +238,12 @@ fn range(low: Version, high: Version) -> Vec<Comparator> {
     ]
 }
 
+/// Exclusive upper bound: the lowest pre-release, so no pre-release of `major.minor.patch` matches.
 fn version(major: u64, minor: u64, patch: u64) -> Version {
-    Version::new(major, minor, patch)
+    Version {
+        pre: Prerelease::new("0").expect("valid pre-release"),
+        ..Version::new(major, minor, patch)
+    }
 }
 
 /// A possibly incomplete version such as `1`, `1.2` or `v1.2.3-beta`.
@@ -359,6 +358,7 @@ mod tests {
         check("1.0 - 2.0", &["1.0.0", "2.0.9"], &["2.1.0", "0.9.0"]);
         check("1.0.0 - 2.1.0", &["2.1.0"], &["2.1.1"]);
         check("1 - 2", &["2.9.0"], &["3.0.0"]);
+        check("1.0 - 2.0", &[], &["2.1.0-beta"]);
     }
 
     #[test]
@@ -368,6 +368,27 @@ mod tests {
             ">=2.0.0-beta",
             &["2.0.0-beta", "2.0.0-rc.1", "2.0.0"],
             &["2.0.0-alpha"],
+        );
+    }
+
+    #[test]
+    fn upper_bounds_exclude_prereleases_of_the_next_version() {
+        check(
+            "^1.0.0-beta",
+            &["1.5.0", "1.0.0-beta.2"],
+            &["2.0.0-beta", "2.0.0"],
+        );
+        check("~1.2.0-rc", &["1.2.5"], &["1.3.0-alpha"]);
+        check("<2.0.0", &["1.9.9"], &["2.0.0-beta", "2.0.0"]);
+        check("<2.0.0-rc", &["2.0.0-beta"], &["2.0.0-rc", "2.0.0"]);
+    }
+
+    #[test]
+    fn prerelease_opt_in_is_per_alternative() {
+        check(
+            "^1.0 || >=3.0.0-beta",
+            &["1.5.0", "3.0.0-beta"],
+            &["1.5.0-beta"],
         );
     }
 

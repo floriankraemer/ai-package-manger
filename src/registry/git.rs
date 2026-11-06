@@ -1,16 +1,19 @@
 //! A registry that lists exactly one repository, written inline in aip.json.
 //!
 //! ```json
-//! { "type": "git", "name": "acme", "url": "git@github.com:acme/private-skills.git" }
+//! { "type": "git", "url": "git@github.com:acme/private-skills.git" }
 //! ```
+//!
+//! The repository name is derived from the URL (`acme/private-skills`); add `"name"` to override it.
 
-use super::{Entry, Registry, validated_entry};
+use super::{Entry, RawEntry, Registry, validated_entry};
 use crate::Result;
 use std::path::PathBuf;
 
 /// Single repository declared in aip.json (like a Composer `vcs` repository).
 pub struct GitRepositoryRegistry {
-    pub name: String,
+    /// Optional override; derived from `url` when absent.
+    pub name: Option<String>,
     pub url: String,
     /// Folder of aip.json; relative local URLs resolve against it.
     pub base: PathBuf,
@@ -25,7 +28,7 @@ impl Registry for GitRepositoryRegistry {
     }
 
     fn repositories(&self) -> Result<Vec<Entry>> {
-        let entry = Entry {
+        let entry = RawEntry {
             name: self.name.clone(),
             url: self.url.clone(),
         };

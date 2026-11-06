@@ -53,8 +53,8 @@ make run ARGS="detect --json ."
 |---|---|
 | Skill | A folder that contains a `SKILL.md` file and optional helper files. AI harnesses load it as an instruction package. |
 | Repository | A git repository that holds one or more skills under `skills/<skill>/`. |
-| Registry | A list of repositories, each with a short name and a git URL. A registry is a JSON document (a local file or a download) or a single inline git repository. |
-| Package name | `<repository name>/<skill>`, for example `anthropic/pdf`. The repository name comes from the registry, not from the git URL. |
+| Registry | A list of repositories, each with a git URL and an optional name. A registry is a JSON document (a local file or a download) or a single inline git repository. |
+| Package name | `<repository name>/<skill>`, for example `anthropics/skills/pdf`. The repository name is `<owner>/<repo>`, derived from the git URL unless the registry sets `name`. See [Repository names](#repository-names). |
 | Provider | An AI harness aip knows about (Claude Code, Codex, Cursor, ...). Each provider with skills support has a skill folder. |
 | Project scope | The default. `aip.json`, `aip.lock` and the skill folders live in the current directory. |
 | Global scope | Selected with `-g/--global`. `aip.json` and `aip.lock` live in `$AIP_HOME`, skill folders live in your home folder. Like `composer global`. |
@@ -83,7 +83,7 @@ The table lives in `src/detect.rs`.
 1. Create a registry at `~/.aip/registry.json`:
 
    ```json
-   { "repositories": [ { "name": "anthropic", "url": "https://github.com/anthropics/skills.git" } ] }
+   { "repositories": [ { "url": "https://github.com/anthropics/skills.git" } ] }
    ```
 
 2. Go to your project and look for skills:
@@ -96,7 +96,7 @@ The table lives in `src/detect.rs`.
 3. Install one:
 
    ```sh
-   aip install anthropic/pdf
+   aip install anthropics/skills/pdf
    ```
 
    aip detects your providers (if `aip.json` does not name any yet), writes `aip.json` and `aip.lock`, and copies the skill into each provider's skill folder.
@@ -161,20 +161,20 @@ This only affects detection.
 ### aip search
 
 ```sh
-aip search <query>
-aip search --json <query>
+aip search [-g] [--json] <query>
 ```
 
 Looks up skills in all repositories of your registries.
 The query is case-insensitive and matches the package name and the description.
 aip uses each skill's latest stable version and reads its `SKILL.md` from there.
-`search` always works on the current directory: it reads `aip.json` there, if present, to find the registries.
-It has no `--global` flag.
+`search` works on the current directory: it reads `aip.json` there, if present, to find the registries.
+With `-g/--global` it uses the registries of the global `aip.json` in `$AIP_HOME`, like `aip install -g`.
+A skill that no version tag contains is shown as `dev-<default branch>`; see [Versioning for skill authors](#versioning-for-skill-authors).
 
 ```
 $ aip search pdf
-anthropic/pdf    1.2.0      Work with PDF files
-anthropic/xlsx   dev-main   Create spreadsheets and read PDF exports
+anthropics/skills/pdf    1.2.0      Work with PDF files
+anthropics/skills/xlsx   dev-main   Create spreadsheets and read PDF exports
 ```
 
 If nothing matches: `No skills found matching '<query>'.`
@@ -189,19 +189,20 @@ A repository that cannot be reached is skipped with `warning: skipping repositor
 ### aip info
 
 ```sh
-aip info <repository>/<skill>
-aip info --json <repository>/<skill>
+aip info [-g] [--json] <repository>/<skill>
 ```
 
 Shows the full description of one skill from the registry, wrapped to 80 columns.
-It looks the skill up like `aip search`, so it is as slow and reads `aip.json` in the current directory the same way.
-If no skill has that exact name: `error: skill '<name>' not found in the registry`.
+It looks up only the named repository in your registries and fetches only that repository, then reads the skill at its latest version, like `aip search`.
+It reads `aip.json` in the current directory (or the global one with `-g/--global`) to find the registries.
+If the repository is not in any registry, the error names the registries and may suggest similar names.
+If the repository has no such skill: `error: skill '<name>' not found in <url>`.
 `--json` prints the same object as one `search` entry.
 
 ### aip check
 
 ```sh
-aip check [-g] [--json]
+aip check [-g] [--strict] [--json]
 ```
 
 Shows every skill in `aip.json` with its locked version, its constraint, the newest stable version, and a status.
@@ -222,9 +223,10 @@ The first status that applies is shown:
 
 | Status | Meaning |
 |---|---|
-| `not installed` | The skill is not in `aip.lock`. Run `aip install`. |
+| `not installed` | The skill is not in `aip.lock`. `aip install` refuses such requirements, so run `aip update <name>`. |
 | `source changed` | The locked URL differs from the registry URL. Run `aip update <name>`. |
 | `folder missing` | A skill folder of a provider lacks the skill. Run `aip install`. |
+| `folder out of date` | A skill folder holds another commit than the lock, for example after a failed run, or was installed before aip wrote `.aip-package` markers. Run `aip install`. |
 | `new commits: 1a2b3c4` | A `dev-<branch>` skill has a newer commit. Run `aip update`. |
 | `update available: 1.1.0` | A newer version fits the constraint. Run `aip update`. |
 | `update available: 1.1.0 (2.0.0 outside constraint)` | Same, and an even newer version needs a changed constraint. |
@@ -237,10 +239,14 @@ Below the table, aip prints error details and every next step that applies, such
 If everything is current it prints `All skills are up to date.`
 `--json` prints an array with `name`, `constraint`, `installed`, `latest` and `status` (an object with a `state` field).
 
+Exit status: `aip check` exits with 1 when any row is `error (see below)`, and with 0 otherwise.
+With `--strict` it also exits with 1 when any row is not `up to date`, which makes it usable as a CI gate.
+The exit status is the same with `--json`.
+
 ### aip install
 
 ```sh
-aip install [<repository>/<skill>[:<constraint>]...] [-g] [--force]
+aip install [<repository>/<skill>[:<constraint>]...] [-g] [--force] [--dry-run]
 ```
 
 With packages, aip adds them to `aip.json` (creating the file if needed), resolves them and installs them.
@@ -249,37 +255,41 @@ For a `0.0.x` version the default is `^0.0.<patch>`.
 A package you name is always resolved again, even if it is already locked.
 
 Without packages, aip installs what `aip.json` and `aip.lock` say.
+If there is no `aip.lock` at all, for example in a fresh clone where the lock was not committed, aip prints `No aip.lock found; resolving requirements from aip.json.` to standard error and resolves every requirement as `aip update` would.
+This also applies when you name packages: the other requirements are resolved too.
 Locked packages that still satisfy their constraint are installed at the locked commit.
 Like Composer, aip does not silently change versions here.
 If a requirement is not in `aip.lock`, or its locked version no longer satisfies the constraint in `aip.json`, `aip install` stops with `aip.lock is out of date with aip.json`, lists the packages, and writes nothing.
 Run `aip update <package>...` to resolve them, or name the package in `aip install <package>[:<constraint>]`.
 Packages that are no longer required are removed from the lock and from disk.
-aip also checks that the URL locked for every package matches the one the registries list for its repository.
+aip also checks that the URL locked for every package matches the one the registries list for its repository, and that every locked commit is what its version says: the commit of the version's tag, or a commit on the branch for `dev-<branch>`.
+A skill folder is rewritten only if it does not already hold the locked commit, so running `aip install` again repairs folders left behind by a failed run.
 Runs are serialized per project: a second aip process in the same project waits until the first one has finished.
 
 If `aip.json` has no `providers`, aip fills them from `aip detect` (only providers that support skills).
 
 ```
-$ aip install anthropic/pdf
+$ aip install anthropics/skills/pdf
 Package operations: 1 install, 0 updates, 0 removals
-  - Installing anthropic/pdf (1.2.0)
+  - Installing anthropics/skills/pdf (1.2.0)
 Skill folders: .claude/skills, .agents/skills
 ```
 
 While it works, aip prints `Fetching <git url>` to standard error, once per repository.
 
 ```
-$ aip install anthropic/pdf:^1.2 anthropic/xlsx:dev-main
+$ aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main
 ```
 
 When nothing needs to change: `Nothing to install, update or remove`.
 With `--global`, folders are shown as `~/.claude/skills`.
 `--force` replaces folders that aip did not install; see [Safety](#safety-unmanaged-folders-and---force).
+`--dry-run` prints the same `Package operations` list, after the line `Dry run: nothing was changed.`, and writes nothing: no `aip.json`, no `aip.lock`, no skill folders.
 
 ### aip update
 
 ```sh
-aip update [<repository>/<skill>...] [-g] [--force]
+aip update [<repository>/<skill>...] [-g] [--force] [--dry-run]
 ```
 
 Re-resolves the named packages, or all required packages if you name none, to the newest version their constraint allows.
@@ -287,33 +297,35 @@ It updates `aip.lock` and the skill folders; `aip.json` keeps its constraints.
 A package must already be in `aip.json`.
 
 ```
-$ aip update anthropic/pdf
+$ aip update anthropics/skills/pdf
 Package operations: 0 installs, 1 update, 0 removals
-  - Upgrading anthropic/pdf (1.2.0 => 1.3.0)
+  - Upgrading anthropics/skills/pdf (1.2.0 => 1.3.0)
 Skill folders: .claude/skills, .agents/skills
 ```
 
 The verb is `Upgrading`, `Downgrading` or `Updating` (for branch constraints, where versions cannot be compared).
 For `dev-<branch>` constraints, `update` moves the lock to the current head of the branch.
-The change shows the short commits, for example `Updating anthropic/xlsx (dev-main 1a2b3c4 => dev-main 5d6e7f8)`.
+The change shows the short commits, for example `Updating anthropics/skills/xlsx (dev-main 1a2b3c4 => dev-main 5d6e7f8)`.
 
 ### aip remove
 
 ```sh
-aip remove <repository>/<skill>... [-g]
+aip remove <repository>/<skill>... [-g] [--dry-run]
 ```
 
-Removes packages from `aip.json` and `aip.lock` and deletes their skill folders from every provider folder.
-aip deletes only folders for packages that the lock lists.
+Removes packages from `aip.json` and `aip.lock` and deletes their skill folders from the skill folder of every known provider, also of providers that are not in `aip.json`.
+aip deletes only folders that it installed for that package (see [Safety](#safety-unmanaged-folders-and---force)).
+Other folders with the same name stay, with `warning: not removing <path>: it was not installed by aip`.
 
 ```
-$ aip remove anthropic/pdf
+$ aip remove anthropics/skills/pdf
 Package operations: 0 installs, 0 updates, 1 removal
-  - Removing anthropic/pdf (1.2.0)
+  - Removing anthropics/skills/pdf (1.2.0)
 Skill folders: .claude/skills, .agents/skills
 ```
 
 `remove` has no `--force`.
+`--dry-run` works as for `install`.
 
 The summary line pluralises by count: "1 install", "0 installs", "1 removal".
 
@@ -328,8 +340,8 @@ The summary line pluralises by count: "1 install", "0 installs", "1 removal".
     ],
     "providers": ["claude-code", "codex"],
     "require": {
-        "anthropic/pdf": "^1.2",
-        "anthropic/xlsx": "dev-main"
+        "anthropics/skills/pdf": "^1.2",
+        "anthropics/skills/xlsx": "dev-main"
     }
 }
 ```
@@ -337,7 +349,7 @@ The summary line pluralises by count: "1 install", "0 installs", "1 removal".
 - `registries` is optional.
   Relative paths resolve against the folder of `aip.json`.
   If you set it, aip uses only those registries and ignores `$AIP_HOME/registry.json`.
-  Types: `json` (`path` of a registry file, or `url` of a registry to download) and `git` (`name` and `url` of one repository, see [Private repositories](#private-repositories)).
+  Types: `json` (`path` of a registry file, or `url` of a registry to download) and `git` (`url` and optional `name` of one repository, see [Private repositories](#private-repositories)).
 - `providers` lists provider ids.
   Unknown ids are an error.
   Providers without skills support are skipped with a warning.
@@ -348,6 +360,12 @@ The summary line pluralises by count: "1 install", "0 installs", "1 removal".
 
 `aip.lock` contains for each package: `name`, `version`, `description` (if any), `source` (`type: git`, `url`, `reference` = commit SHA) and `path`.
 aip rewrites it only when the content changes.
+
+A repository on the local file system has a path as its URL.
+In `aip.lock`, aip stores such a path relative to the folder of `aip.json`, with `/` separators, for example `../my-skills`, so the committed lock works for your teammates.
+It keeps an absolute path when no relative path exists, for example on another Windows drive.
+When reading, aip resolves the locked path against the folder of `aip.json` before it compares it with the registries, so locks that contain absolute paths keep working.
+For `--global`, the folder of `aip.json` is `$AIP_HOME`.
 
 ## Version constraints
 
@@ -378,7 +396,9 @@ Tilde follows Composer, not Cargo.
 Use `~1.2.3` to stay within one minor version.
 
 Pre-release rule: a version such as `2.0.0-beta` only matches a constraint that itself names a pre-release (for example `>=2.0.0-beta`).
+With `||`, each alternative decides on its own: `^1.0 || >=3.0.0-beta` accepts `3.0.0-beta` but not `1.5.0-beta`.
 `^1.0` never installs `1.1.0-beta`.
+Like Composer, an upper bound excludes the pre-releases of the bound itself: `^1.0.0-beta` and `<2.0.0` do not match `2.0.0-beta`.
 The default constraint and `search` ignore pre-releases.
 
 Branch constraints (`dev-<branch>`) match no tag.
@@ -398,7 +418,11 @@ aip versions skills by git tags.
 - If a skill has at least one per-skill tag, only the per-skill tags apply to that skill, and repository tags are ignored for it.
   Other skills in the same repository keep using the repository tags.
 - Tags that contain a `/` never count as repository tags.
-- Without any version tag, the skill is only available as `dev-<branch>`.
+- A tag only counts for a skill if the tag contains `skills/<skill>/SKILL.md`.
+  A skill you add after the last repository tag is not versioned by that tag.
+- Without any version tag that counts, the skill is only available as `dev-<branch>`.
+  This is also the default constraint, the version `search` shows, and the latest version `aip check` reports.
+- For a constraint, aip takes the newest matching version whose tag contains the skill.
 
 Example: tags `v1.0.0`, `v1.1.0`, `pdf/v2.0.0` mean `pdf` is at `2.0.0`, and every other skill is at `1.1.0`.
 
@@ -441,20 +465,42 @@ my-skills/
 
 Then add the repository to a registry and tag releases (see above).
 
+## Repository names
+
+A repository name is `<owner>/<repo>`, taken from the full path of the git URL.
+You do not have to write it in the registry.
+aip lowercases the path, removes query, fragment and a trailing `.git`, and keeps every path segment, so GitLab subgroups work.
+
+| URL | Repository name | Package name for skill `pdf` |
+|---|---|---|
+| `https://github.com/anthropics/skills.git` | `anthropics/skills` | `anthropics/skills/pdf` |
+| `git@github.com:FlorianKraemer/claude-ai.git` | `floriankraemer/claude-ai` | `floriankraemer/claude-ai/pdf` |
+| `https://gitlab.com/group/sub/repo` | `group/sub/repo` | `group/sub/repo/pdf` |
+| `../my-skills` (local path) | `my-skills` | `my-skills/pdf` |
+
+For Azure DevOps aip drops the `_git` segment and the leading `v3` of the SSH form, so `https://dev.azure.com/org/proj/_git/repo` becomes `org/proj/repo`.
+A local path yields only its last folder name.
+If aip cannot derive a valid name, it stops with an error that asks you to set `"name"`.
+
+Set `"name"` in a registry entry to override the derived name.
+Each `/`-separated segment may use lowercase letters, digits, `.`, `_` and `-`.
+If your `aip.json` still requires a package under an older explicit name, the `unknown repository` error suggests the derived name.
+
 ## Writing a registry file
 
 ```json
 {
     "repositories": [
-        { "name": "anthropic", "url": "https://github.com/anthropics/skills.git" },
-        { "name": "mine", "url": "../my-skills" }
+        { "url": "https://github.com/anthropics/skills.git" },
+        { "url": "../my-skills", "name": "mine/skills" }
     ]
 }
 ```
 
-- `name` is the first half of every package name.
-  Same character rules as skill names.
-  Names must be unique inside one file.
+- `name` is optional and overrides the repository name derived from `url`.
+  It is the first part of every package name.
+  Each `/`-separated segment follows the same character rules as skill names.
+  Names, derived or explicit, must be unique inside one file.
 - `url` is anything `git clone` accepts: HTTPS, SSH (`git@host:path`), or a local path.
 - A relative local path resolves against the folder of the registry file.
 - Unknown keys in the file or in an entry are an error.
@@ -500,16 +546,17 @@ You do not need a registry file for it.
 ```json
 {
     "registries": [
-        { "type": "git", "name": "acme", "url": "git@github.com:acme/private-skills.git" },
+        { "type": "git", "url": "git@github.com:acme/private-skills.git" },
         { "type": "json", "path": "registry.json" }
     ],
     "require": {
-        "acme/review": "^1.0"
+        "acme/private-skills/review": "^1.0"
     }
 }
 ```
 
-- `name` follows the same rules as a repository name in a registry file.
+- `name` is optional and follows the same rules as a repository name in a registry file.
+  Without it, the name is derived from `url` (here `acme/private-skills`).
 - `url` is anything `git clone` accepts.
   A relative local path resolves against the folder of `aip.json`.
 - Unknown keys are an error.
@@ -630,7 +677,11 @@ On every run that needs the registry, aip asks the server if the copy is still c
 The cache is per URL.
 A changed URL starts with an empty cache.
 Offline, this only covers the registry.
-Repositories that are not yet in the git cache (`$AIP_HOME/cache/repos`) still need the network.
+
+For git repositories, `aip install` without packages does not fetch if the git cache (`$AIP_HOME/cache/repos`) already has every locked commit.
+So you can reinstall from `aip.lock` offline, as long as the registries can be read (a local file, or a cached copy of a URL registry).
+aip fetches only when a locked commit is missing from the cache, or does not match its version there.
+`aip update`, `aip install <package>`, `aip check` and `aip search` always fetch, because they look for new versions.
 
 To clear the registry cache, delete the folder `$AIP_HOME/cache/registries`.
 
@@ -646,23 +697,78 @@ To clear the registry cache, delete the folder `$AIP_HOME/cache/registries`.
 
 An empty `AIP_HOME` is treated as unset.
 Repositories are cached as bare git mirrors, so you can delete `$AIP_HOME/cache` at any time.
+The cache holds only branches and tags.
+aip refuses skill files over 20 MiB, skills over 100 MiB or 5000 files, and file names that Windows cannot create.
 Git credentials (SSH keys, credential helpers) are those of your `git` command.
 
 ## Safety: unmanaged folders and --force
 
-aip only replaces or deletes a skill folder if `aip.lock` says aip installed it.
-If `.claude/skills/pdf` already exists and the lock has no entry for a package with skill name `pdf`, `aip install` stops with:
+### The .aip-package marker
+
+Every skill folder that aip installs contains a file `.aip-package`:
+
+```json
+{
+    "name": "anthropics/skills/pdf",
+    "reference": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+}
+```
+
+It names the package and the commit in the folder.
+aip treats a folder as its own only if the marker names the package.
+It does not use `aip.lock` for this, because a lock can be edited or come from someone else.
+Do not edit or copy the marker.
+If you change a skill by hand, delete its marker, so that aip does not replace your change without `--force`.
+
+### Folders aip did not install
+
+If `.claude/skills/pdf` exists and has no marker for the package that installs `pdf`, `aip install` and `aip update` stop with:
 
 ```
 error: refusing to overwrite .claude/skills/pdf: it was not installed by aip (use --force to replace it)
 ```
 
 Nothing is changed in this case.
+This also applies when you add a provider whose skill folder already has a folder of that name.
 `--force` (on `install` and `update`) replaces the folder.
+aip never deletes a folder without a matching marker, also not with `--force`.
+It skips it with `warning: not removing <path>: it was not installed by aip`.
 Two packages that would install the same skill name (for example `a/pdf` and `b/pdf`) are rejected, because skill folders are named by skill only.
 
-aip copies each skill into a temporary folder `.<skill>.aip-tmp` next to the target and then renames it, so a failed copy does not leave half a skill.
-aip writes `aip.json` and `aip.lock` before it changes skill folders; if something fails, run `aip install` again to finish.
+Folders installed by aip versions without markers are adopted once: aip rewrites such a folder (with a marker) if `aip.lock` lists the package and the folder's `SKILL.md` is the one at the locked commit.
+If you changed that `SKILL.md`, aip asks for `--force`.
+
+### Removed providers
+
+When you remove a provider from `aip.json`, the next `install`, `update` or `remove` deletes the copies aip installed in that provider's skill folder.
+The output lists them as `Removing <package> from <folder>`.
+aip looks in the skill folders of all providers it knows, and deletes only folders with a marker for a package of the lock.
+
+### Symbolic links
+
+In a project, aip refuses a skill folder that is reached through a symbolic link, for example a committed `.claude/skills` that links to `~/.local`:
+
+```
+error: refusing to use <project>/.claude/skills: <project>/.claude/skills is a symbolic link
+```
+
+Otherwise a repository could make aip write files, or delete folders, outside the project.
+Replace the link with a real folder.
+A skill folder of a provider that is not in `aip.json` is skipped instead.
+With `--global`, links are allowed, because many people link their dotfiles.
+A skill folder that is itself a symbolic link (`.claude/skills/pdf -> ...`) is never followed: aip treats it as a folder it did not install.
+
+### Failed runs
+
+aip first copies every skill into a temporary folder `.<skill>.aip-tmp` next to its target.
+If one copy fails (for example, a read-only folder), aip deletes the temporary folders and stops; `aip.json`, `aip.lock` and the skill folders are unchanged.
+Only when every copy is ready does aip write `aip.json` and `aip.lock` and swap the folders in.
+If a swap fails after that, `aip check` shows `folder out of date` and `aip install` finishes the job.
+
+### Dry run
+
+`--dry-run` on `install`, `update` and `remove` shows what would change and writes nothing.
+It still fetches repositories into the cache, as a normal run would.
 
 ## Troubleshooting
 
@@ -701,11 +807,14 @@ Messages are shown as `error: <message>`.
 
 | Message | Meaning and fix |
 |---|---|
-| `invalid package name '<name>' (expected <repository>/<skill> using lowercase letters, digits, '.', '_', '-')` | Name has uppercase letters, extra `/`, `..`, or a leading `.`/`-`. |
+| `invalid package name '<name>' (expected <repository>/<skill>, e.g. owner/repo/skill, using lowercase letters, digits, '.', '_', '-')` | Name has uppercase letters, an empty or `..` segment, or a segment with a leading `.`/`-`. |
 | `invalid version constraint '<input>': <reason>` (prefixed with `<package>: ` when it comes from install/update) | Constraint syntax error: empty, bad number, operator without version, bad branch name. See the table above. |
 | `<package>: no version matches '<constraint>' (available: <list>)` | No tag satisfies the constraint. Pre-releases are excluded unless named. `available: none` means no version tags; use `dev-<branch>`. |
 | `<package>: branch '<branch>' not found in <url>` | The `dev-` branch does not exist in the repository. |
 | `<package>: skill '<skill>' not found in <url> at <version> (expected skills/<skill>/SKILL.md)` | The skill does not exist at that version. Check the name and tag. |
+| `<package>: skill '<skill>' not found in <url> at any version matching '<constraint>' (expected skills/<skill>/SKILL.md)` | Tags match the constraint, but none of them contains the skill. Use a wider constraint or `dev-<branch>`. |
+| `skill '<name>' not found in <url>` (from `aip info`) | The repository has no skill of that name. |
+| `repository '<name>' in <registry>: URL must not start with '-'` | A registry entry has a URL that git could read as an option. Fix the URL. |
 | `tag '<tag>' does not point to a commit` | The tag is broken. Ask the repository owner. |
 | `default branch '<branch>' has no commits` | Empty repository. |
 | `<a> and <b> both install a skill named '<skill>'` | Two packages share a skill name. Remove one. |
@@ -729,10 +838,11 @@ Messages are shown as `error: <message>`.
 | `registry <url> uses plain http; use https` | Use an `https://` URL (`http://` is only allowed for localhost). |
 | `repository '<name>' in registry <url>: a remote registry may only list remote git URLs` | Entries of a downloaded registry must be `https://`, `ssh://`, `git://` or `user@host:path` URLs. |
 | `a "json" registry needs "path" or "url"` / `... either "path" or "url", not both` / `"path" is a URL; use "url" instead` | Fix the registry entry in `aip.json` (shown as `invalid aip.json: ...`). |
-| `invalid repository name '<name>' in registry <path> (use lowercase letters, digits, '.', '_', '-')` | Rename the entry. |
+| `invalid repository name '<name>' in registry <path> (use lowercase letters, digits, '.', '_', '-', segments separated by '/')` | Rename the entry. |
 | `repository '<name>' in <registry>: URL contains credentials; remove them ...` | The URL has a password or token. See [Private repositories](#private-repositories). |
+| `cannot derive a repository name from <url>; set "name" ...` | The URL has no usable path, or a segment uses other characters than the allowed ones. Add `"name"` to the entry. |
 | `duplicate repository name '<name>' in registry <path>` | Names must be unique in one file. Use a second registry for overrides. |
-| `unknown repository '<name>' (not listed in any registry: <paths>)` | The first half of the package name is not in any registry. For a locked package the message starts with `<package>: `. |
+| `unknown repository '<name>' (not listed in any registry: <paths>)` | The part of the package name before the skill is not in any registry. A `; did you mean '<owner>/<repo>'?` hint lists listed names that end or start with it. For a locked package the message starts with `<package>: `. |
 | `cannot resolve <url>: <os error>` | A relative local URL could not be made absolute. |
 
 ### Git
@@ -743,7 +853,7 @@ Messages are shown as `error: <message>`.
 | `cannot run git: <os error>` | git exists but cannot start. |
 | `cannot clone <url>: <git message>` | Network, URL or credentials. Try `git clone <url>` yourself. |
 | `hint: the repository may be private; ...` | Printed after a clone or fetch error that looks like an authentication failure. See [Private repositories](#private-repositories). |
-| `cannot fetch <url>: <git message>` | Same, for an already cached repository. Offline use is not supported. |
+| `cannot fetch <url>: <git message>` | Same, for an already cached repository. Installing from `aip.lock` works offline only if the cache has every locked commit; see [Offline use](#offline-use-and-the-registry-cache). |
 | `cannot create cache directory <dir>` / `cannot move clone to <dir>` | File system error under `$AIP_HOME/cache`. |
 | `warning: skipping repository '<name>': <reason>` | `search` could not read one repository; the others are still shown. |
 
@@ -752,3 +862,6 @@ Messages are shown as `error: <message>`.
 | Message | Meaning and fix |
 |---|---|
 | `refusing to overwrite <path>: it was not installed by aip (use --force to replace it)` | See [Safety](#safety-unmanaged-folders-and---force). Move the folder away, or use `--force`. |
+| `warning: not removing <path>: it was not installed by aip` | The folder has no `.aip-package` marker for the removed package, so aip leaves it alone. Delete it yourself if you do not need it. |
+| `refusing to use <dir>: <path> is a symbolic link` | A project skill folder is reached through a symbolic link. See [Symbolic links](#symbolic-links). |
+| `aip.lock: <name> <version> is locked to commit <sha>, which is not tagged <version> in <url>; run ...` | The commit in `aip.lock` is not the one of the version's tag (or, for `dev-<branch>`, not on the branch). The lock was edited, or the tag was moved. Review the lock change, then run `aip update <name>`. |

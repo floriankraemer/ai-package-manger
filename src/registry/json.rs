@@ -1,12 +1,13 @@
 //! A registry stored as a JSON document, read from a local file or downloaded over HTTP(S).
 //!
 //! ```json
-//! { "repositories": [ { "name": "anthropic", "url": "https://github.com/anthropics/skills.git" } ] }
+//! { "repositories": [ { "url": "https://github.com/anthropics/skills.git" } ] }
 //! ```
 
 use super::cache::{self, CacheEntry};
 use super::{
-    Entry, Registry, RegistryContext, check_no_credentials, is_remote_git_url, validated_entry,
+    Entry, RawEntry, Registry, RegistryContext, check_no_credentials, is_remote_git_url,
+    validated_entry,
 };
 use crate::http::{self, Request, Response};
 use crate::{Context, Error, Result};
@@ -21,7 +22,7 @@ const MAX_REGISTRY_BYTES: u64 = 10_000_000;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    repositories: Vec<Entry>,
+    repositories: Vec<RawEntry>,
 }
 
 /// Where a `json` registry is configured to come from: exactly one of `path` or `url`.
@@ -189,8 +190,8 @@ impl JsonRegistry {
         let file: File =
             serde_json::from_str(text).context(|| format!("invalid registry {location}"))?;
         let mut entries: Vec<Entry> = Vec::new();
-        for entry in file.repositories {
-            let entry = self.validated(entry)?;
+        for raw in file.repositories {
+            let entry = self.validated(raw)?;
             if entries.iter().any(|e| e.name == entry.name) {
                 return Err(Error::new(format!(
                     "duplicate repository name '{}' in registry {location}",
@@ -204,23 +205,23 @@ impl JsonRegistry {
 
     /// Checks one entry; remote registries may only list remote git URLs, file registries
     /// resolve relative local URLs against the file's folder.
-    fn validated(&self, entry: Entry) -> Result<Entry> {
+    fn validated(&self, raw: RawEntry) -> Result<Entry> {
         let location = self.location();
         match &self.source {
             Source::File(path) => {
                 let base = path.parent().unwrap_or(Path::new(""));
-                validated_entry(entry, base, &location)
+                validated_entry(raw, base, &location)
             }
             Source::Url { .. } => {
-                if !is_remote_git_url(&entry.url) {
-                    check_no_credentials(&entry.url)
-                        .context(|| format!("repository '{}' in {location}", entry.name))?;
+                if !is_remote_git_url(&raw.url) {
+                    check_no_credentials(&raw.url)
+                        .context(|| format!("{} in {location}", raw.label()))?;
                     return Err(Error::new(format!(
-                        "repository '{}' in registry {location}: a remote registry may only list remote git URLs",
-                        entry.name
+                        "{} in registry {location}: a remote registry may only list remote git URLs",
+                        raw.label()
                     )));
                 }
-                validated_entry(entry, Path::new(""), &location)
+                validated_entry(raw, Path::new(""), &location)
             }
         }
     }
@@ -254,7 +255,7 @@ fn offline_warning(url: &str, reason: &str, age_seconds: u64) -> String {
 fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => Error::new(format!(
-            "registry not found at {} (create it with {{\"repositories\": [{{\"name\": \"<name>\", \"url\": \"<git url>\"}}]}} or list registries under \"registries\" in aip.json)",
+            "registry not found at {} (create it with {{\"repositories\": [{{\"url\": \"<git url>\"}}]}} or list registries under \"registries\" in aip.json)",
             path.display()
         )),
         _ => Error::new(format!("cannot read registry {}: {e}", path.display())),

@@ -34,5 +34,6 @@
 - [0007 Authentication delegated to git](architecture/decisions/0007-authentication-delegated-to-git.md)
 - [0008 HTTP client: ureq with rustls](architecture/decisions/0008-http-client-ureq.md)
 - [0009 auth.json for HTTP registries](architecture/decisions/0009-auth-json-for-http-registries.md)
+- [0010 Repository names from URLs](architecture/decisions/0010-repository-names-from-urls.md)
 
 The C4 views are embedded in the arc42 sections: context in 03, containers and components in 05.

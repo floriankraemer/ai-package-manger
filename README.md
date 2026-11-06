@@ -33,14 +33,14 @@ Create a project configuration, then find and install a skill:
 cd my-project
 aip init --provider claude-code      # or just `aip init` to detect your providers
 aip search pdf                       # find skills in the registry
-aip info anthropic/pdf               # read the full description of one skill
-aip install anthropic/pdf            # add it to aip.json and install it
+aip info anthropics/skills/pdf               # read the full description of one skill
+aip install anthropics/skills/pdf            # add it to aip.json and install it
 ```
 
 ```
-$ aip install anthropic/pdf
+$ aip install anthropics/skills/pdf
 Package operations: 1 install, 0 updates, 0 removals
-  - Installing anthropic/pdf (1.2.0)
+  - Installing anthropics/skills/pdf (1.2.0)
 Skill folders: .claude/skills
 ```
 
@@ -52,7 +52,7 @@ Keep skills current:
 ```sh
 aip check                            # installed versions and available updates
 aip update                           # move to the newest versions aip.json allows
-aip remove anthropic/pdf             # remove a skill and delete its folder
+aip remove anthropics/skills/pdf             # remove a skill and delete its folder
 ```
 
 ```
@@ -68,7 +68,7 @@ Run `aip update` to apply 1 available update.
 Pin versions with Composer-style constraints:
 
 ```sh
-aip install anthropic/pdf:^1.2 anthropic/xlsx:dev-main
+aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main
 ```
 
 Other commands and options:
@@ -80,6 +80,9 @@ Other commands and options:
 | `aip search <query>` | Search the registry by name or description |
 | `aip info <repository>/<skill>` | Show the full description of a skill |
 | `aip check`, `install`, `update`, `remove` | Manage installed skills; add `-g/--global` to use your home folder, like `composer global` |
+
+`search` and `info` also take `-g/--global` to use the global registries.
+`aip check` exits with 1 on errors; `aip check --strict` exits with 1 unless every skill is up to date, for CI.
 
 `--json` gives machine-readable output for `detect`, `search`, `info`, and `check`.
 

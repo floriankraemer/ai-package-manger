@@ -20,13 +20,13 @@ flowchart LR
 ```
 
 The user (or a CI job) runs `aip`.
-aip reads the registries to learn repository names and URLs, fetches those repositories from their git remotes, and copies skill folders into the folders the AI harnesses read.
+aip reads the registries to learn repository URLs (and names, derived from the URLs unless set), fetches those repositories from their git remotes, and copies skill folders into the folders the AI harnesses read.
 The harnesses themselves are not called; aip only writes files they pick up.
 
 | Partner | Direction | Content |
 |---|---|---|
 | User | in | Command line, `aip.json` edits |
-| Registry file | in | `{"repositories": [{"name", "url"}]}` |
+| Registry file | in | `{"repositories": [{"url", "name"?}]}` |
 | Git remote | in | Repository objects (tags, branches, `skills/<skill>/...`) |
 | Harness skill folder | out | Skill folder per package |
 | `aip.json`, `aip.lock` | in and out | Requirements and resolved state |
