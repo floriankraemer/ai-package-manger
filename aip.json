@@ -3,6 +3,6 @@
         "claude-code"
     ],
     "require": {
-        "floriankraemer/symfony": "dev-master"
+        "floriankraemer/claude-ai/symfony": "dev-master"
     }
 }
