@@ -738,6 +738,11 @@ Two packages that would install the same skill name (for example `a/pdf` and `b/
 Folders installed by aip versions without markers are adopted once: aip rewrites such a folder (with a marker) if `aip.lock` lists the package and the folder's `SKILL.md` is the one at the locked commit.
 If you changed that `SKILL.md`, aip asks for `--force`.
 
+If you rename a requirement and keep the repository and the skill (for example `floriankraemer/symfony` to `floriankraemer/claude-ai/symfony`), aip replaces the old folder with the new package, without `--force` and without a warning.
+This works when the folder's marker names the old package, or when it has no marker and its `SKILL.md` is the one at the old locked commit.
+The output shows `Removing` for the old name and `Installing` for the new name.
+If the new name points to a different repository URL, aip refuses as for any other folder it did not install.
+
 ### Removed providers
 
 When you remove a provider from `aip.json`, the next `install`, `update` or `remove` deletes the copies aip installed in that provider's skill folder.

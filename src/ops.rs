@@ -856,6 +856,8 @@ fn plan(
     force: bool,
 ) -> Result<Plan> {
     let mut seen = HashMap::new();
+    // Folders a renamed package takes over from the dropped package that installed them.
+    let mut replaced = HashSet::new();
     let mut plan = Plan {
         changes: Vec::new(),
         pruned: Vec::new(),
@@ -866,22 +868,11 @@ fn plan(
         if new.get(&pkg.name).is_some() {
             continue;
         }
-        let skill = skill_of(pkg)?;
+        skill_of(pkg)?;
         plan.changes.push(Change::Remove {
             name: pkg.name.clone(),
             version: pkg.version.clone(),
         });
-        for dir in targets.iter().chain(others) {
-            let dest = dir.join(skill);
-            if owned_by(&dest, &pkg.name) {
-                plan.deletes.push(dest);
-            } else if targets.contains(dir) && dest.symlink_metadata().is_ok() {
-                eprintln!(
-                    "warning: not removing {}: it was not installed by aip",
-                    dest.display()
-                );
-            }
-        }
     }
     for pkg in &new.packages {
         let skill = skill_of(pkg)?;
@@ -898,20 +889,50 @@ fn plan(
                 plan.pruned.push((pkg.name.clone(), dir.clone()));
             }
         }
+        // Old entries that may own the skill folder: this package, or one dropped from the lock
+        // in this run (a rename) that installed the same skill from the same repository.
+        let owners: Vec<&LockedPackage> = old
+            .packages
+            .iter()
+            .filter(|o| {
+                (o.name == pkg.name || new.get(&o.name).is_none())
+                    && o.source.url == pkg.source.url
+                    && registry::split_package(&o.name).is_ok_and(|(_, s)| s == skill)
+            })
+            .collect();
         let mut stale = Vec::new();
         for target in targets {
             let dest = target.join(skill);
-            match marker(&dest) {
-                Some(m) if m.name == pkg.name => {
-                    if m.reference != pkg.source.reference {
-                        stale.push(target.clone());
-                    }
-                }
-                _ if dest.symlink_metadata().is_err() => stale.push(target.clone()),
-                _ if force || installed_before_markers(&dest, old, pkg, resolver)? => {
+            let found = marker(&dest);
+            if found.as_ref().is_some_and(|m| m.name == pkg.name) {
+                if found.is_some_and(|m| m.reference != pkg.source.reference) {
                     stale.push(target.clone());
                 }
-                _ => {
+                continue;
+            }
+            if dest.symlink_metadata().is_err() {
+                stale.push(target.clone());
+                continue;
+            }
+            let mut owner = None;
+            for o in &owners {
+                let owns = match &found {
+                    Some(m) => m.name == o.name,
+                    None => installed_before_markers(&dest, o, pkg, resolver)?,
+                };
+                if owns {
+                    owner = Some(o);
+                    break;
+                }
+            }
+            match owner {
+                Some(o) if o.name != pkg.name => {
+                    replaced.insert(dest);
+                    stale.push(target.clone());
+                }
+                Some(_) => stale.push(target.clone()),
+                None if force => stale.push(target.clone()),
+                None => {
                     return Err(Error::new(format!(
                         "refusing to overwrite {}: it was not installed by aip (use --force to replace it)",
                         dest.display()
@@ -938,24 +959,40 @@ fn plan(
         });
         plan.writes.push((pkg.clone(), stale));
     }
+    for pkg in &old.packages {
+        if new.get(&pkg.name).is_some() {
+            continue;
+        }
+        let skill = skill_of(pkg)?;
+        for dir in targets.iter().chain(others) {
+            let dest = dir.join(skill);
+            if replaced.contains(&dest) {
+                continue; // a renamed package takes this folder over
+            }
+            if owned_by(&dest, &pkg.name) {
+                plan.deletes.push(dest);
+            } else if targets.contains(dir) && dest.symlink_metadata().is_ok() {
+                eprintln!(
+                    "warning: not removing {}: it was not installed by aip",
+                    dest.display()
+                );
+            }
+        }
+    }
     Ok(plan)
 }
 
 /// Migration for folders installed before aip wrote markers: a folder without any marker
-/// counts as aip's when the old lock has the package from the same repository and the
-/// folder's SKILL.md is the one at the old locked commit. Used to overwrite, never to delete.
+/// counts as `prev`'s when its SKILL.md is the one at the commit `prev` locked. `prev` is the old
+/// lock entry for the same skill and repository as `pkg`. Used to overwrite, never to delete.
 // ponytail: SKILL.md comparison only; drop this once installs without markers are gone.
 fn installed_before_markers(
     dest: &Path,
-    old: &Lock,
+    prev: &LockedPackage,
     pkg: &LockedPackage,
     resolver: &mut Resolver,
 ) -> Result<bool> {
-    let Some(prev) = old.get(&pkg.name) else {
-        return Ok(false);
-    };
-    if prev.source.url != pkg.source.url
-        || dest.join(MARKER_FILE).symlink_metadata().is_ok()
+    if dest.join(MARKER_FILE).symlink_metadata().is_ok()
         || !dest.symlink_metadata().is_ok_and(|m| m.is_dir())
     {
         return Ok(false);
@@ -2179,6 +2216,84 @@ mod tests {
         );
         assert_eq!(read(&folder.join("SKILL.md")), "mine");
         assert!(f.lock().get("demo/mine").is_none());
+    }
+
+    /// Installs `demo/hello`, then renames its requirement to `other/hello`, which the registry
+    /// lists at `other_url`. Returns the report of the `aip update` that applies the rename.
+    fn rename_to_other(f: &Fixture, other_url: &str) -> Result<Report> {
+        fs::write(
+            f.root.join("registry.json"),
+            format!(
+                r#"{{"repositories": [{{"name": "demo", "url": "repo"}}, {{"name": "other", "url": "{other_url}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let mut manifest = f.manifest();
+        let constraint = manifest.require.remove("demo/hello").unwrap();
+        manifest.require.insert("other/hello".into(), constraint);
+        manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
+        update(&f.project, &[], Options::default())
+    }
+
+    fn assert_renamed(f: &Fixture, report: &Report) {
+        assert_eq!(
+            report.changes,
+            [
+                Change::Remove {
+                    name: "demo/hello".into(),
+                    version: "2.0.0".into()
+                },
+                Change::Install {
+                    name: "other/hello".into(),
+                    version: "2.0.0".into()
+                }
+            ]
+        );
+        assert!(read(&f.skill_dir().join(MARKER_FILE)).contains("\"other/hello\""));
+        assert!(installed_version(f).contains("version 2.0.0"));
+        assert!(f.lock().get("demo/hello").is_none());
+    }
+
+    #[test]
+    fn renamed_package_takes_over_folder_with_marker() {
+        let f = Fixture::new("rename-marker");
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        let report = rename_to_other(&f, "repo").unwrap();
+        assert_renamed(&f, &report);
+    }
+
+    #[test]
+    fn renamed_package_takes_over_unmodified_markerless_folder() {
+        let f = Fixture::new("rename-markerless");
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        fs::remove_file(f.skill_dir().join(MARKER_FILE)).unwrap();
+        let report = rename_to_other(&f, "repo").unwrap();
+        assert_renamed(&f, &report);
+    }
+
+    #[test]
+    fn renamed_package_does_not_take_over_edited_markerless_folder() {
+        let f = Fixture::new("rename-edited");
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        fs::remove_file(f.skill_dir().join(MARKER_FILE)).unwrap();
+        fs::write(f.skill_dir().join("SKILL.md"), "edited").unwrap();
+        let err = rename_to_other(&f, "repo").unwrap_err();
+        assert!(err.to_string().contains("not installed by aip"), "{err}");
+        assert_eq!(installed_version(&f), "edited");
+    }
+
+    #[test]
+    fn renamed_package_from_another_url_does_not_take_over() {
+        let f = Fixture::new("rename-other-url");
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        let copy = f.root.join("repo2");
+        git(
+            &f.root,
+            &["clone", "--quiet", "repo", copy.to_str().unwrap()],
+        );
+        let err = rename_to_other(&f, "repo2").unwrap_err();
+        assert!(err.to_string().contains("not installed by aip"), "{err}");
+        assert!(read(&f.skill_dir().join(MARKER_FILE)).contains("\"demo/hello\""));
     }
 
     #[cfg(unix)]
