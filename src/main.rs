@@ -82,15 +82,18 @@ enum Command {
     },
     /// Add skills to aip.json and install everything locked in aip.lock
     #[command(
-        after_help = "Examples:\n  aip install anthropics/skills/pdf\n  aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main\n  aip install            # install from aip.lock"
+        after_help = "Examples:\n  aip install anthropics/skills/pdf\n  aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main\n  aip install acme/skills/pdf --as acme-pdf\n  aip install            # install from aip.lock"
     )]
     Install {
         /// Skills to add, as <repository>/<skill>[:<constraint>]
         packages: Vec<String>,
+        /// Install the one named skill into this folder instead of its own name
+        #[arg(long = "as", value_name = "FOLDER")]
+        alias: Option<String>,
         /// Use the global aip.json in $AIP_HOME and install into your home folder
         #[arg(short, long)]
         global: bool,
-        /// Replace skill folders that were not installed by aip
+        /// Replace skill folders that were not installed by aip or have local changes
         #[arg(long)]
         force: bool,
         /// Show what would change without writing anything
@@ -104,7 +107,7 @@ enum Command {
         /// Use the global aip.json in $AIP_HOME and install into your home folder
         #[arg(short, long)]
         global: bool,
-        /// Replace skill folders that were not installed by aip
+        /// Replace skill folders that were not installed by aip or have local changes
         #[arg(long)]
         force: bool,
         /// Show what would change without writing anything
@@ -119,6 +122,9 @@ enum Command {
         /// Use the global aip.json in $AIP_HOME and remove from your home folder
         #[arg(short, long)]
         global: bool,
+        /// Delete skill folders even if they have local changes
+        #[arg(long)]
+        force: bool,
         /// Show what would change without writing anything
         #[arg(long)]
         dry_run: bool,
@@ -153,12 +159,14 @@ fn main() -> ExitCode {
             }),
         Command::Install {
             packages,
+            alias,
             global,
             force,
             dry_run,
         } => project(global).and_then(|p| {
             let options = Options { force, dry_run };
-            show(&p, ops::install(&p, &packages, options)?, dry_run)
+            let report = ops::install_as(&p, &packages, alias.as_deref(), options)?;
+            show(&p, report, dry_run)
         }),
         Command::Update {
             packages,
@@ -172,12 +180,10 @@ fn main() -> ExitCode {
         Command::Remove {
             packages,
             global,
+            force,
             dry_run,
         } => project(global).and_then(|p| {
-            let options = Options {
-                force: false,
-                dry_run,
-            };
+            let options = Options { force, dry_run };
             show(&p, ops::remove(&p, &packages, options)?, dry_run)
         }),
     };
@@ -210,10 +216,7 @@ fn show(project: &Project, report: Report, dry_run: bool) -> aip::Result<()> {
         println!("Nothing to install, update or remove");
         return Ok(());
     }
-    let shown = |dir: &Path| match project.scope {
-        Scope::Project => relative(dir, &project.root),
-        Scope::Global => format!("~{}{}", path::MAIN_SEPARATOR, relative(dir, &project.root)),
-    };
+    let shown = |dir: &Path| shown_dir(dir, project);
     let count = |pred: fn(&ops::Change) -> bool| report.changes.iter().filter(|c| pred(c)).count();
     let installs = count(|c| matches!(c, ops::Change::Install { .. }));
     let updates = count(|c| matches!(c, ops::Change::Update { .. }));
@@ -238,7 +241,7 @@ fn show(project: &Project, report: Report, dry_run: bool) -> aip::Result<()> {
 fn run_init(project: &Project, providers: Vec<String>) -> aip::Result<()> {
     let dirs = ops::init(project, providers)?;
     println!("Created {}", project.manifest_path.display());
-    let dirs: Vec<_> = dirs.iter().map(|d| relative(d, &project.root)).collect();
+    let dirs: Vec<_> = dirs.iter().map(|d| shown_dir(d, project)).collect();
     println!("Skill folders: {}", dirs.join(", "));
     Ok(())
 }
@@ -334,6 +337,7 @@ fn check_hints(rows: &[SkillStatus]) -> Vec<String> {
             Status::UpdateAvailable { .. } | Status::NewCommits { .. }
         )
     });
+    let modified = names(|s| matches!(s, Status::ModifiedLocally { .. }));
     let moved = names(|s| matches!(s, Status::SourceChanged { .. }));
     let outside = names(|s| {
         matches!(
@@ -353,6 +357,12 @@ fn check_hints(rows: &[SkillStatus]) -> Vec<String> {
     }
     if !missing.is_empty() {
         lines.push("Run `aip install` to install missing or out-of-date skills.".into());
+    }
+    if !modified.is_empty() {
+        lines.push(format!(
+            "Local changes in {} will block update/remove; use --force to discard them.",
+            modified.join(", ")
+        ));
     }
     if !updates.is_empty() {
         lines.push(format!(
@@ -513,6 +523,18 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// A skill folder as printed: relative to the project, or `~/…` for the home folder in global
+/// scope. A global folder outside home (e.g. `CLAUDE_CONFIG_DIR`) prints in full.
+fn shown_dir(dir: &Path, project: &Project) -> String {
+    match project.scope {
+        Scope::Project => relative(dir, &project.root),
+        Scope::Global => match dir.strip_prefix(&project.root) {
+            Ok(rel) => format!("~{}{}", path::MAIN_SEPARATOR, rel.display()),
+            Err(_) => dir.display().to_string(),
+        },
+    }
+}
+
 fn relative(path: &Path, base: &Path) -> String {
     path.strip_prefix(base)
         .unwrap_or(path)
@@ -523,6 +545,20 @@ fn relative(path: &Path, base: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_folders_print_under_home_only_when_inside_it() {
+        let project = Project::global(PathBuf::from("/home/u"), PathBuf::from("/aip"));
+        let sep = path::MAIN_SEPARATOR;
+        assert_eq!(
+            shown_dir(Path::new("/home/u/.claude/skills"), &project),
+            format!("~{sep}{}", Path::new(".claude/skills").display())
+        );
+        assert_eq!(
+            shown_dir(Path::new("/tmp/cfg/skills"), &project),
+            Path::new("/tmp/cfg/skills").display().to_string()
+        );
+    }
 
     #[test]
     fn summarize_takes_first_sentence_and_truncates() {
@@ -557,6 +593,18 @@ mod tests {
             hints.contains(
                 &"Run `aip install` to install missing or out-of-date skills.".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn hints_warn_about_local_changes() {
+        let rows = [row("a/x", Status::ModifiedLocally { files: 2 })];
+        assert_eq!(rows[0].to_string(), "modified locally (2 files)");
+        assert_eq!(status_color(&rows[0].status), Color::Red);
+        assert!(check_failed(&rows, true) && !check_failed(&rows, false));
+        assert_eq!(
+            check_hints(&rows),
+            ["Local changes in a/x will block update/remove; use --force to discard them."]
         );
     }
 

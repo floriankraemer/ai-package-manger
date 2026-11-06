@@ -6,7 +6,7 @@
 //!
 //! The repository name is derived from the URL (`acme/private-skills`); add `"name"` to override it.
 
-use super::{Entry, RawEntry, Registry, validated_entry};
+use super::{Listing, RawEntry, Registry, check_entry, normalize};
 use crate::Result;
 use std::path::PathBuf;
 
@@ -21,17 +21,18 @@ pub struct GitRepositoryRegistry {
 
 impl Registry for GitRepositoryRegistry {
     fn location(&self) -> String {
-        self.base
-            .join(crate::manifest::MANIFEST_FILE)
+        normalize(&self.base.join(crate::manifest::MANIFEST_FILE))
             .display()
             .to_string()
     }
 
-    fn repositories(&self) -> Result<Vec<Entry>> {
+    fn listing(&self) -> Result<Listing> {
         let entry = RawEntry {
             name: self.name.clone(),
             url: self.url.clone(),
         };
-        Ok(vec![validated_entry(entry, &self.base, &self.location())?])
+        Ok(Listing::collect(vec![entry], |raw| {
+            check_entry(raw, &self.base)
+        }))
     }
 }

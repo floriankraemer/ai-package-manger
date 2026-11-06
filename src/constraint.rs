@@ -1,4 +1,5 @@
-//! Composer-style version constraints (`^1.2`, `~1.2.3`, `1.2.*`, `>=1.0 <2.0 || ^3.0`, `dev-main`).
+//! Composer-style version constraints (`^1.2`, `~1.2.3`, `1.2.*`, `>=1.0 <2.0 || ^3.0`, `dev-main`,
+//! `dev-main#1a2b3c4`, `^1.0@beta`).
 //!
 //! Semantics follow Composer, which differs from Cargo for `~1.2` (`>=1.2.0 <2.0.0`), so
 //! `semver::VersionReq` is not reused; `semver::Version` provides parsing and ordering.
@@ -7,14 +8,64 @@ use semver::{BuildMetadata, Prerelease, Version};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Constraint {
-    /// Head of a branch: `dev-<branch>`.
-    Branch(String),
+    /// Head of a branch, `dev-<branch>`, or with `commit` set (lowercase hex, 7 to 64 digits,
+    /// possibly abbreviated) that commit of the branch: `dev-<branch>#<commit>`.
+    Branch {
+        name: String,
+        commit: Option<String>,
+    },
     /// Version range: any alternative (`||`) whose comparators all match.
     Range {
+        /// Least stable pre-release accepted by alternatives that do not name one (`@beta`).
+        stability: Stability,
         /// Each alternative with its pre-release opt-in: pre-release versions only match an
         /// alternative that itself names one.
         alternatives: Vec<(Vec<Comparator>, bool)>,
     },
+}
+
+/// Composer stability flag, from least to most stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stability {
+    Dev,
+    Alpha,
+    Beta,
+    Rc,
+    Stable,
+}
+
+impl Stability {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag.to_ascii_lowercase().as_str() {
+            "dev" => Some(Self::Dev),
+            "alpha" => Some(Self::Alpha),
+            "beta" => Some(Self::Beta),
+            "rc" => Some(Self::Rc),
+            "stable" => Some(Self::Stable),
+            _ => None,
+        }
+    }
+
+    /// No pre-release is stable; otherwise the first pre-release identifier decides.
+    fn of(v: &Version) -> Self {
+        let pre = v.pre.as_str().to_ascii_lowercase();
+        let id = pre.split('.').next().unwrap_or("");
+        let letter_digit = |letter: char| {
+            let mut chars = id.chars();
+            chars.next() == Some(letter) && chars.next().is_none_or(|c| c.is_ascii_digit())
+        };
+        if pre.is_empty() {
+            Self::Stable
+        } else if id.starts_with("rc") {
+            Self::Rc
+        } else if id.starts_with("beta") || letter_digit('b') {
+            Self::Beta
+        } else if id.starts_with("alpha") || letter_digit('a') {
+            Self::Alpha
+        } else {
+            Self::Dev
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,12 +107,52 @@ impl Constraint {
     pub fn parse(input: &str) -> Result<Self, String> {
         let invalid = |reason: String| format!("invalid version constraint '{input}': {reason}");
         let s = input.trim();
-        if let Some(branch) = s.strip_prefix("dev-") {
-            if !valid_branch(branch) {
-                return Err(invalid(format!("bad branch name '{branch}'")));
+        if let Some(rest) = s.strip_prefix("dev-") {
+            if rest
+                .rsplit_once('@')
+                .is_some_and(|(_, flag)| Stability::from_flag(flag).is_some())
+            {
+                return Err(invalid(
+                    "a stability flag does not apply to a branch".into(),
+                ));
             }
-            return Ok(Self::Branch(branch.to_string()));
+            let (name, commit) = match rest.split_once('#') {
+                Some((name, hash)) => (name, Some(hash)),
+                None => (rest, None),
+            };
+            if !valid_branch(name) {
+                return Err(invalid(format!("bad branch name '{name}'")));
+            }
+            if let Some(hash) = commit
+                && !((7..=64).contains(&hash.len()) && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                return Err(invalid(
+                    "the commit after '#' must be 7 to 64 hexadecimal digits".into(),
+                ));
+            }
+            return Ok(Self::Branch {
+                name: name.to_string(),
+                commit: commit.map(str::to_ascii_lowercase),
+            });
         }
+        let (s, stability) = match s.rsplit_once('@') {
+            Some((range, flag)) => {
+                let stability = Stability::from_flag(flag.trim()).ok_or_else(|| {
+                    invalid(format!(
+                        "unknown stability '{flag}' (use dev, alpha, beta, RC or stable)"
+                    ))
+                })?;
+                (
+                    if range.trim().is_empty() {
+                        "*"
+                    } else {
+                        range.trim()
+                    },
+                    stability,
+                )
+            }
+            None => (s, Stability::Stable),
+        };
         let mut alternatives = Vec::new();
         for alt in s.split('|').map(str::trim).filter(|a| !a.is_empty()) {
             let comparators = match alt.split_once(" - ") {
@@ -75,15 +166,22 @@ impl Constraint {
         if alternatives.is_empty() {
             return Err(invalid("empty".into()));
         }
-        Ok(Self::Range { alternatives })
+        Ok(Self::Range {
+            stability,
+            alternatives,
+        })
     }
 
     /// Whether a tagged version satisfies this constraint. Branch constraints match no tag.
     pub fn matches(&self, v: &Version) -> bool {
         match self {
-            Self::Branch(_) => false,
-            Self::Range { alternatives } => alternatives.iter().any(|(all, prerelease)| {
-                (v.pre.is_empty() || *prerelease) && all.iter().all(|c| c.matches(v))
+            Self::Branch { .. } => false,
+            Self::Range {
+                stability,
+                alternatives,
+            } => alternatives.iter().any(|(all, prerelease)| {
+                (v.pre.is_empty() || *prerelease || Stability::of(v) >= *stability)
+                    && all.iter().all(|c| c.matches(v))
             }),
         }
     }
@@ -92,7 +190,7 @@ impl Constraint {
 /// Whether a locked version label (`1.2.3` or `dev-main`) satisfies `constraint`.
 pub fn satisfies(constraint: &str, version: &str) -> bool {
     match Constraint::parse(constraint) {
-        Ok(Constraint::Branch(branch)) => version.strip_prefix("dev-") == Some(branch.as_str()),
+        Ok(Constraint::Branch { name, .. }) => version.strip_prefix("dev-") == Some(name.as_str()),
         Ok(range) => parse_version(version).is_some_and(|v| range.matches(&v)),
         Err(_) => false,
     }
@@ -117,7 +215,7 @@ fn valid_branch(name: &str) -> bool {
         && !name.contains("..")
         && !name
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\#".contains(c))
 }
 
 /// `>=1.0 <2.0`, `>=1.0,<2.0`, `>= 1.0`.
@@ -401,10 +499,66 @@ mod tests {
         assert_eq!(parse_version("hello/v1.0.0"), None);
         assert_eq!(
             Constraint::parse("dev-main"),
-            Ok(Constraint::Branch("main".into()))
+            Ok(Constraint::Branch {
+                name: "main".into(),
+                commit: None
+            })
         );
         assert!(Constraint::parse("dev--x").is_err());
         assert!(Constraint::parse("dev-a..b").is_err());
+    }
+
+    #[test]
+    fn commit_pins() {
+        assert_eq!(
+            Constraint::parse("dev-feature/x#1A2b3C4"),
+            Ok(Constraint::Branch {
+                name: "feature/x".into(),
+                commit: Some("1a2b3c4".into())
+            })
+        );
+        assert!(Constraint::parse(&format!("dev-main#{}", "a".repeat(64))).is_ok());
+        for bad in [
+            "dev-main#",
+            "dev-main#abc12",
+            "dev-main#xyz1234",
+            "dev-main#1a2b3c4#1a2b3c4",
+            &format!("dev-main#{}", "a".repeat(65)),
+            "dev-#1a2b3c4",
+            "dev-main#abc1234@beta",
+        ] {
+            assert!(Constraint::parse(bad).is_err(), "{bad:?} should be invalid");
+        }
+        assert!(satisfies("dev-main#1a2b3c4", "dev-main"));
+        assert!(!satisfies("dev-main#1a2b3c4", "dev-next"));
+    }
+
+    #[test]
+    fn stability_flags() {
+        check(
+            "^1.0@beta",
+            &["1.2.0-beta.1", "1.2.0-rc1", "1.2.0", "1.2.0-b2"],
+            &["1.2.0-alpha", "1.2.0-a1", "2.0.0-beta", "1.2.0-dev"],
+        );
+        check("^1.0@RC", &["1.2.0-RC2"], &["1.2.0-beta"]);
+        check("^1.0@alpha", &["1.2.0-alpha", "1.2.0-a"], &["1.2.0-dev"]);
+        check("@dev", &["1.0.0-dev", "1.0.0-3", "1.0.0-foo", "2.0.0"], &[]);
+        check("@beta", &["3.0.0-beta1"], &["3.0.0-alpha1"]);
+        check(
+            ">=1.0 <2.0@rc",
+            &["1.5.0-rc.1"],
+            &["1.5.0-beta", "2.0.0-rc.1"],
+        );
+        check("^1.0@stable", &["1.1.0"], &["1.1.0-rc"]);
+        // The flag applies to every alternative.
+        check(
+            "^1.0 || ^3.0@beta",
+            &["1.5.0-beta", "3.1.0-beta"],
+            &["1.5.0-alpha"],
+        );
+        for bad in ["^1.0@", "^1.0@nightly", "dev-main@beta"] {
+            assert!(Constraint::parse(bad).is_err(), "{bad:?} should be invalid");
+        }
     }
 
     #[test]

@@ -5,7 +5,9 @@ use crate::constraint::{self, Constraint};
 use crate::detect::{self, Scope};
 use crate::filelock::{self, FileLock};
 use crate::git::Repo;
-use crate::manifest::{self, LOCK_FILE, Lock, LockedPackage, MANIFEST_FILE, Manifest, Source};
+use crate::manifest::{
+    self, LOCK_FILE, Lock, LockedPackage, MANIFEST_FILE, Manifest, Requirement, Source,
+};
 use crate::registry::{self, JsonRegistry, Registries, RegistryContext};
 use crate::{Context, Error, Result, fnv1a};
 use semver::Version;
@@ -148,6 +150,8 @@ pub enum Change {
         name: String,
         from: String,
         to: String,
+        /// `(old, new)` folder name when the package's `"as"` changed.
+        folder: Option<(String, String)>,
     },
     Remove {
         name: String,
@@ -160,7 +164,12 @@ impl fmt::Display for Change {
         match self {
             Self::Install { name, version } => write!(f, "Installing {name} ({version})"),
             Self::Remove { name, version } => write!(f, "Removing {name} ({version})"),
-            Self::Update { name, from, to } => {
+            Self::Update {
+                name,
+                from,
+                to,
+                folder,
+            } => {
                 let verb = match (
                     constraint::parse_version(from),
                     constraint::parse_version(to),
@@ -169,7 +178,11 @@ impl fmt::Display for Change {
                     (Some(a), Some(b)) if b < a => "Downgrading",
                     _ => "Updating",
                 };
-                write!(f, "{verb} {name} ({from} => {to})")
+                write!(f, "{verb} {name} ({from} => {to}")?;
+                if let Some((old, new)) = folder {
+                    write!(f, ", folder {old} => {new}")?;
+                }
+                f.write_str(")")
             }
         }
     }
@@ -187,7 +200,7 @@ pub struct Report {
 /// Flags shared by `install`, `update` and `remove`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    /// Replace skill folders that aip did not install.
+    /// Replace skill folders that aip did not install, and discard local changes in its own.
     pub force: bool,
     /// Work out and report the changes without writing anything.
     pub dry_run: bool,
@@ -196,6 +209,26 @@ pub struct Options {
 /// `aip install [packages]`: adds `<name>[:<constraint>]` specs to aip.json, then installs
 /// everything from aip.lock. Requirements the lock does not cover are an error unless named.
 pub fn install(project: &Project, specs: &[String], options: Options) -> Result<Report> {
+    install_as(project, specs, None, options)
+}
+
+/// [`install`] with `--as`: the one package named in `specs` is installed into folder `alias`.
+pub fn install_as(
+    project: &Project,
+    specs: &[String],
+    alias: Option<&str>,
+    options: Options,
+) -> Result<Report> {
+    if let Some(alias) = alias {
+        if specs.len() != 1 {
+            return Err(Error::new("--as needs exactly one package"));
+        }
+        if !registry::valid_name(alias) {
+            return Err(Error::new(format!(
+                "invalid --as '{alias}' (use lowercase letters, digits, '.', '_', '-')"
+            )));
+        }
+    }
     let _lock = project.lock()?;
     let existing = Manifest::read(&project.manifest_path)?;
     if existing.is_none() && specs.is_empty() {
@@ -229,7 +262,15 @@ pub fn install(project: &Project, specs: &[String], options: Options) -> Result<
             None => resolver.default_constraint(name)?,
         };
         new.upsert(resolver.resolve(name, &constraint)?);
-        manifest.require.insert(name.to_string(), constraint);
+        // Naming a package again keeps its folder unless `--as` gives a new one.
+        let alias = alias
+            .map(str::to_string)
+            .or_else(|| manifest.require.get(name).and_then(|r| r.alias.clone()));
+        let requirement = Requirement {
+            version: constraint,
+            alias,
+        };
+        manifest.require.insert(name.to_string(), requirement);
         forced.insert(name.to_string());
     }
     refresh(&manifest, &mut new, &mut resolver, &forced)?;
@@ -436,6 +477,11 @@ pub enum Status {
     FolderMissing,
     /// A skill folder does not hold the locked commit (or predates aip's markers).
     FolderOutdated,
+    /// Files in a skill folder were edited, added or deleted since aip installed it; `files` is
+    /// how many differ (in the folder with the most).
+    ModifiedLocally {
+        files: usize,
+    },
     SourceChanged {
         registry_url: String,
     },
@@ -470,6 +516,9 @@ impl fmt::Display for SkillStatus {
             Status::NotInstalled => f.write_str("not installed"),
             Status::FolderMissing => f.write_str("folder missing"),
             Status::FolderOutdated => f.write_str("folder out of date"),
+            Status::ModifiedLocally { files } => {
+                write!(f, "modified locally ({})", files_label(*files))
+            }
             Status::SourceChanged { .. } => f.write_str("source changed"),
             Status::Error { .. } => f.write_str("error (see below)"),
         }
@@ -494,20 +543,32 @@ pub fn check(project: &Project) -> Result<Vec<SkillStatus>> {
     // `targets` may fill in providers; do that on a copy so nothing is written back.
     let targets = targets(project, &mut manifest.clone())?;
     let mut resolver = Resolver::new(project, &manifest);
+    resolver.locked_urls = lock
+        .packages
+        .iter()
+        .map(|p| (p.name.clone(), p.source.url.clone()))
+        .collect();
     Ok(manifest
         .require
         .iter()
-        .map(|(name, constraint)| {
+        .map(|(name, requirement)| {
+            let constraint = &requirement.version;
             let locked = lock.get(name);
-            let (latest, status) = check_package(&mut resolver, name, constraint, locked, &targets)
-                .unwrap_or_else(|e| {
-                    (
-                        None,
-                        Status::Error {
-                            message: e.to_string(),
-                        },
-                    )
-                });
+            // The folder aip.json asks for, even if aip.lock still has another `as`.
+            let wanted = locked.map(|p| LockedPackage {
+                alias: requirement.alias.clone(),
+                ..p.clone()
+            });
+            let (latest, status) =
+                check_package(&mut resolver, name, constraint, wanted.as_ref(), &targets)
+                    .unwrap_or_else(|e| {
+                        (
+                            None,
+                            Status::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                    });
             SkillStatus {
                 name: name.clone(),
                 constraint: constraint.clone(),
@@ -529,33 +590,45 @@ fn check_package(
 ) -> Result<(Option<String>, Status)> {
     let registry_url = resolver.url_of(name)?;
     let allowed = resolver.resolve(name, constraint)?;
-    let is_branch = matches!(Constraint::parse(constraint), Ok(Constraint::Branch(_)));
-    let latest = if is_branch {
+    let (is_branch, pinned) = match Constraint::parse(constraint) {
+        Ok(Constraint::Branch { name, commit }) => (true, commit.map(|_| name)),
+        _ => (false, None),
+    };
+    let latest = if let Some(branch) = pinned {
+        // A pin is deliberate: show where the branch is, but do not report it as outdated.
+        let head = resolver.resolve(name, &format!("dev-{branch}"))?;
+        Some(short_sha(&head.source.reference).to_string())
+    } else if is_branch {
         Some(allowed.version.clone())
     } else {
-        resolver.resolve(name, "*").ok().map(|p| p.version)
+        resolver
+            .resolve(name, &latest_query(constraint))
+            .ok()
+            .map(|p| p.version)
     };
-    let (folder_missing, folder_outdated) = match locked {
-        Some(p) => {
-            let skill = skill_of(p)?;
-            let want = Marker {
-                name: p.name.clone(),
-                reference: p.source.reference.clone(),
-            };
-            (
-                targets.iter().any(|t| !t.join(skill).is_dir()),
-                targets
-                    .iter()
-                    .any(|t| marker(&t.join(skill)).as_ref() != Some(&want)),
-            )
+    let (mut folder_missing, mut folder_outdated, mut modified) = (false, false, 0);
+    if let Some(p) = locked {
+        let folder = folder_of(p)?;
+        for target in targets {
+            let dir = target.join(folder);
+            folder_missing |= !dir.is_dir();
+            match marker(&dir) {
+                Some(m) if m.name == p.name && m.reference == p.source.reference => {
+                    let repo = resolver.mirror(&p.source.url)?;
+                    if let Some(changed) = local_changes(&dir, &m, repo)? {
+                        modified = modified.max(changed.len());
+                    }
+                }
+                _ => folder_outdated = true,
+            }
         }
-        None => (false, false),
-    };
+    }
     let status = match locked {
         None => Status::NotInstalled,
         Some(p) if p.source.url != registry_url => Status::SourceChanged { registry_url },
         Some(_) if folder_missing => Status::FolderMissing,
         Some(_) if folder_outdated => Status::FolderOutdated,
+        Some(_) if modified > 0 => Status::ModifiedLocally { files: modified },
         Some(p) if is_branch => {
             if p.source.reference == allowed.source.reference {
                 Status::UpToDate
@@ -568,6 +641,15 @@ fn check_package(
         Some(p) => range_status(p, &allowed, latest.as_deref()),
     };
     Ok((latest, status))
+}
+
+/// What "latest" means for `constraint`: `*`, with the constraint's stability flag if it has one,
+/// so `^1.0@beta` is compared against the newest beta rather than the newest stable release.
+fn latest_query(constraint: &str) -> String {
+    match constraint.rsplit_once('@') {
+        Some((_, flag)) => format!("*@{flag}"),
+        None => "*".to_string(),
+    }
 }
 
 /// Status of a locked package against a range constraint.
@@ -590,6 +672,11 @@ fn range_status(locked: &LockedPackage, allowed: &LockedPackage, latest: Option<
     }
 }
 
+/// `1 file`, `3 files`.
+fn files_label(n: usize) -> String {
+    format!("{n} file{}", if n == 1 { "" } else { "s" })
+}
+
 fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -606,7 +693,8 @@ fn refresh(
     lock.packages
         .retain(|p| manifest.require.contains_key(&p.name));
     let mut stale = BTreeMap::new();
-    for (name, constraint) in &manifest.require {
+    for (name, requirement) in &manifest.require {
+        let constraint = &requirement.version;
         if forced.contains(name) {
             lock.upsert(resolver.resolve(name, constraint)?);
             continue;
@@ -623,6 +711,10 @@ fn refresh(
             }
             Some(_) => {}
         }
+    }
+    // A changed `"as"` only moves the folder; it needs no new resolution.
+    for pkg in &mut lock.packages {
+        pkg.alias = manifest.require[&pkg.name].alias.clone();
     }
     if stale.is_empty() {
         return Ok(());
@@ -646,7 +738,7 @@ fn verify_sources(lock: &Lock, resolver: &mut Resolver) -> Result<()> {
         let (repository, _) = registry::split_package(&pkg.name)?;
         let entry = resolver
             .registries()
-            .get(repository)
+            .get_locked(repository, &pkg.source.url)
             .map_err(|e| Error::new(format!("{}: {e}", pkg.name)))?;
         if entry.url != pkg.source.url {
             return Err(Error::new(format!(
@@ -679,6 +771,7 @@ fn finish(
         .into_iter()
         .filter(|d| !targets.contains(d) && checked_dir(&project.root, d, project.scope).is_ok())
         .collect();
+    unique_folders(manifest, old, new)?;
     let plan = plan(old, new, targets, &others, resolver, options.force)?;
     let report = Report {
         changes: plan.changes,
@@ -750,12 +843,15 @@ fn skill_dirs<'a>(
     providers: impl Iterator<Item = &'a detect::Provider>,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    for (local, global) in providers.filter_map(|p| p.skills) {
+    for p in providers {
+        let Some((local, global)) = p.skills else {
+            continue;
+        };
         let rel = match project.scope {
             Scope::Project => local,
             Scope::Global => global,
         };
-        let dir = detect::marker_path(&project.root, rel);
+        let dir = detect::scoped_path(p, project.scope, &project.root, rel);
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -816,6 +912,10 @@ pub const MARKER_FILE: &str = ".aip-package";
 struct Marker {
     name: String,
     reference: String,
+    /// Blob id of every file aip wrote, by `/`-separated path relative to the folder. Absent in
+    /// markers of older aip versions, whose folders count as unmodified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    files: Option<BTreeMap<String, String>>,
 }
 
 /// The marker of the skill folder `dir`; `None` if there is none or `dir` is a symbolic link,
@@ -831,9 +931,120 @@ fn marker(dir: &Path) -> Option<Marker> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-/// True if aip installed `dir` for package `name`.
-fn owned_by(dir: &Path, name: &str) -> bool {
-    marker(dir).is_some_and(|m| m.name == name)
+/// Paths in `dir` that differ from what its marker recorded: edited, deleted or added files.
+/// `None` if that is unknown: an old marker without file ids, or ids in a format (SHA-256)
+/// that needs `repo`, the package's cached mirror, which is not there.
+fn local_changes(dir: &Path, marker: &Marker, repo: Option<&Repo>) -> Result<Option<Vec<String>>> {
+    let Some(recorded) = &marker.files else {
+        return Ok(None);
+    };
+    if repo.is_none() && recorded.values().any(|oid| oid.len() != 40) {
+        return Ok(None);
+    }
+    let mut on_disk = Vec::new();
+    let mut changed = Vec::new();
+    walk(dir, "", &mut on_disk, &mut changed)?;
+    on_disk.retain(|path| path != MARKER_FILE);
+    let mut common = Vec::new();
+    for path in on_disk {
+        if recorded.contains_key(&path) {
+            common.push(path);
+        } else {
+            changed.push(path); // added
+        }
+    }
+    let deleted: Vec<String> = recorded
+        .keys()
+        .filter(|path| !common.contains(path) && !changed.contains(path))
+        .cloned()
+        .collect();
+    changed.extend(deleted);
+    let paths: Vec<&str> = common.iter().map(String::as_str).collect();
+    let oids = match repo {
+        Some(repo) => repo.hash_files(dir, &paths)?,
+        None => crate::git::hash_files(None, dir, &paths)?,
+    };
+    for (path, oid) in common.iter().zip(oids) {
+        if recorded[path] != oid {
+            changed.push(path.clone());
+        }
+    }
+    changed.sort();
+    Ok(Some(changed))
+}
+
+/// Collects the `/`-separated paths of regular files under `dir` into `files`. Anything else
+/// (a symbolic link) goes to `other`: aip never writes those.
+fn walk(dir: &Path, prefix: &str, files: &mut Vec<String>, other: &mut Vec<String>) -> Result<()> {
+    let entries = fs::read_dir(dir).context(|| format!("cannot read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.context(|| format!("cannot read {}", dir.display()))?;
+        let path = format!("{prefix}{}", entry.file_name().to_string_lossy());
+        let kind = entry
+            .file_type()
+            .context(|| format!("cannot read {}", entry.path().display()))?;
+        if kind.is_dir() {
+            walk(&entry.path(), &format!("{path}/"), files, other)?;
+        } else if kind.is_file() {
+            files.push(path);
+        } else {
+            other.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Refuses to overwrite or delete aip's folder `dest` when files in it changed since aip wrote
+/// it, unless `force`. `url` is the repository of the package `found` names.
+fn guard_changes(
+    dest: &Path,
+    found: &Marker,
+    url: &str,
+    resolver: &mut Resolver,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let repo = resolver.mirror(url)?;
+    match local_changes(dest, found, repo)? {
+        Some(changed) if !changed.is_empty() => Err(Error::new(format!(
+            "{} has local changes ({}); use --force to discard them",
+            dest.display(),
+            files_label(changed.len())
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Every package needs its own skill folder. Two skills with the same name clash; `"as"` in
+/// aip.json installs one under another name; the hint suggests it for a package new in `lock`.
+fn unique_folders(manifest: &Manifest, old: &Lock, lock: &Lock) -> Result<()> {
+    let mut seen = HashMap::new();
+    for pkg in &lock.packages {
+        let folder = folder_of(pkg)?;
+        let Some(other) = seen.insert(folder, pkg.name.as_str()) else {
+            continue;
+        };
+        let (first, second) = if old.get(other).is_none() {
+            (pkg.name.as_str(), other)
+        } else {
+            (other, pkg.name.as_str())
+        };
+        let (repository, skill) = registry::split_package(second)?;
+        let suggest = format!(
+            "{}-{skill}",
+            repository.rsplit('/').next().unwrap_or(repository)
+        );
+        let version = manifest
+            .require
+            .get(second)
+            .map_or("*", |r| r.version.as_str());
+        return Err(Error::new(format!(
+            "{first} and {second} both install a skill named '{folder}'\nhint: add \"as\" to one of them in {MANIFEST_FILE}, e.g. \"{second}\": {{\"version\": \"{version}\", \"as\": \"{suggest}\"}}"
+        )));
+    }
+    Ok(())
 }
 
 struct Plan {
@@ -845,7 +1056,8 @@ struct Plan {
     deletes: Vec<PathBuf>,
 }
 
-/// Works out what to change on disk, refusing to overwrite skills aip does not manage.
+/// Works out what to change on disk, refusing to overwrite skills aip does not manage, and
+/// (unless `force`) to overwrite or delete its own folders that have local changes.
 /// `others` are skill folders of providers not in aip.json.
 fn plan(
     old: &Lock,
@@ -855,9 +1067,8 @@ fn plan(
     resolver: &mut Resolver,
     force: bool,
 ) -> Result<Plan> {
-    let mut seen = HashMap::new();
-    // Folders a renamed package takes over from the dropped package that installed them.
-    let mut replaced = HashSet::new();
+    // Folders written in this run; none of them may be deleted afterwards.
+    let mut written = HashSet::new();
     let mut plan = Plan {
         changes: Vec::new(),
         pruned: Vec::new(),
@@ -868,44 +1079,45 @@ fn plan(
         if new.get(&pkg.name).is_some() {
             continue;
         }
-        skill_of(pkg)?;
+        folder_of(pkg)?;
         plan.changes.push(Change::Remove {
             name: pkg.name.clone(),
             version: pkg.version.clone(),
         });
     }
     for pkg in &new.packages {
-        let skill = skill_of(pkg)?;
-        if let Some(other) = seen.insert(skill, &pkg.name) {
-            return Err(Error::new(format!(
-                "{other} and {} both install a skill named '{skill}'",
-                pkg.name
-            )));
-        }
+        let folder = folder_of(pkg)?;
         for dir in others {
-            let dest = dir.join(skill);
-            if owned_by(&dest, &pkg.name) {
+            let dest = dir.join(folder);
+            if let Some(found) = marker(&dest).filter(|m| m.name == pkg.name) {
+                guard_changes(&dest, &found, &pkg.source.url, resolver, force)?;
                 plan.deletes.push(dest);
                 plan.pruned.push((pkg.name.clone(), dir.clone()));
             }
         }
-        // Old entries that may own the skill folder: this package, or one dropped from the lock
-        // in this run (a rename) that installed the same skill from the same repository.
-        let owners: Vec<&LockedPackage> = old
-            .packages
-            .iter()
-            .filter(|o| {
-                (o.name == pkg.name || new.get(&o.name).is_none())
-                    && o.source.url == pkg.source.url
-                    && registry::split_package(&o.name).is_ok_and(|(_, s)| s == skill)
-            })
-            .collect();
+        // Old entries that may own the skill folder: this package, or one that leaves the folder
+        // in this run (dropped from the lock, a rename, or given another `"as"`) and installed
+        // it from the same repository.
+        let mut owners = Vec::new();
+        for o in &old.packages {
+            let leaves = match new.get(&o.name) {
+                None => true,
+                Some(n) => folder_of(n)? != folder,
+            };
+            if (o.name == pkg.name || leaves)
+                && o.source.url == pkg.source.url
+                && folder_of(o)? == folder
+            {
+                owners.push(o);
+            }
+        }
         let mut stale = Vec::new();
         for target in targets {
-            let dest = target.join(skill);
+            let dest = target.join(folder);
             let found = marker(&dest);
-            if found.as_ref().is_some_and(|m| m.name == pkg.name) {
-                if found.is_some_and(|m| m.reference != pkg.source.reference) {
+            if let Some(m) = found.as_ref().filter(|m| m.name == pkg.name) {
+                if m.reference != pkg.source.reference {
+                    guard_changes(&dest, m, &pkg.source.url, resolver, force)?;
                     stale.push(target.clone());
                 }
                 continue;
@@ -925,14 +1137,14 @@ fn plan(
                     break;
                 }
             }
-            match owner {
-                Some(o) if o.name != pkg.name => {
-                    replaced.insert(dest);
+            match (owner, &found) {
+                (Some(o), Some(m)) => {
+                    guard_changes(&dest, m, &o.source.url, resolver, force)?;
                     stale.push(target.clone());
                 }
-                Some(_) => stale.push(target.clone()),
-                None if force => stale.push(target.clone()),
-                None => {
+                (Some(_), None) => stale.push(target.clone()),
+                (None, _) if force => stale.push(target.clone()),
+                (None, _) => {
                     return Err(Error::new(format!(
                         "refusing to overwrite {}: it was not installed by aip (use --force to replace it)",
                         dest.display()
@@ -943,13 +1155,20 @@ fn plan(
         if stale.is_empty() {
             continue;
         }
-        plan.changes.push(match old.get(&pkg.name) {
-            Some(prev) if prev.source != pkg.source => {
+        written.extend(stale.iter().map(|t| t.join(folder)));
+        let prev = old.get(&pkg.name);
+        let moved = match prev {
+            Some(prev) => Some(folder_of(prev)?).filter(|f| *f != folder),
+            None => None,
+        };
+        plan.changes.push(match prev {
+            Some(prev) if prev.source != pkg.source || moved.is_some() => {
                 let (from, to) = update_labels(prev, pkg);
                 Change::Update {
                     name: pkg.name.clone(),
                     from,
                     to,
+                    folder: moved.map(|f| (f.to_string(), folder.to_string())),
                 }
             }
             _ => Change::Install {
@@ -959,17 +1178,21 @@ fn plan(
         });
         plan.writes.push((pkg.clone(), stale));
     }
+    // Folders that old packages leave: dropped from the lock, or moved by a new `"as"`.
     for pkg in &old.packages {
-        if new.get(&pkg.name).is_some() {
+        let folder = folder_of(pkg)?;
+        if let Some(n) = new.get(&pkg.name)
+            && folder_of(n)? == folder
+        {
             continue;
         }
-        let skill = skill_of(pkg)?;
         for dir in targets.iter().chain(others) {
-            let dest = dir.join(skill);
-            if replaced.contains(&dest) {
-                continue; // a renamed package takes this folder over
+            let dest = dir.join(folder);
+            if written.contains(&dest) {
+                continue; // another package takes this folder over
             }
-            if owned_by(&dest, &pkg.name) {
+            if let Some(found) = marker(&dest).filter(|m| m.name == pkg.name) {
+                guard_changes(&dest, &found, &pkg.source.url, resolver, force)?;
                 plan.deletes.push(dest);
             } else if targets.contains(dir) && dest.symlink_metadata().is_ok() {
                 eprintln!(
@@ -997,7 +1220,7 @@ fn installed_before_markers(
     {
         return Ok(false);
     }
-    skill_of(prev)?;
+    folder_of(prev)?;
     let repo = resolver.locked_repo(pkg)?;
     if !repo.has_commit(&prev.source.reference) {
         return Ok(false);
@@ -1009,28 +1232,39 @@ fn installed_before_markers(
     Ok(fs::read_to_string(dest.join("SKILL.md")).is_ok_and(|actual| actual == expected))
 }
 
-fn staging_path(dir: &Path, skill: &str) -> PathBuf {
-    dir.join(format!(".{skill}.aip-tmp"))
+fn staging_path(dir: &Path, folder: &str) -> PathBuf {
+    dir.join(format!(".{folder}.aip-tmp"))
 }
 
 /// Exports every write next to its destination, with its marker. Records each staging folder
-/// in `staged` as `(dir, skill)` before writing it, so the caller can clean up after a failure.
+/// in `staged` as `(dir, folder)` before writing it, so the caller can clean up after a failure.
 fn stage(
     writes: &[(LockedPackage, Vec<PathBuf>)],
     resolver: &mut Resolver,
     staged: &mut Vec<(PathBuf, String)>,
 ) -> Result<()> {
     for (pkg, dirs) in writes {
-        let skill = skill_of(pkg)?;
+        let folder = folder_of(pkg)?;
         let repo = resolver.locked_repo(pkg)?;
         for dir in dirs {
-            let staging = staging_path(dir, skill);
+            let staging = staging_path(dir, folder);
             delete(&staging)?;
-            staged.push((dir.clone(), skill.to_string()));
-            repo.export(&pkg.source.reference, &pkg.path, &staging)?;
+            staged.push((dir.clone(), folder.to_string()));
+            let mut files = repo.export(&pkg.source.reference, &pkg.path, &staging)?;
+            if let Some(alias) = &pkg.alias {
+                // The marker records what is on disk, so the rewritten file is not a local change.
+                let path = staging.join("SKILL.md");
+                let text = fs::read_to_string(&path)
+                    .context(|| format!("cannot read {}", path.display()))?;
+                fs::write(&path, rename_skill(&text, alias))
+                    .context(|| format!("cannot write {}", path.display()))?;
+                let oid = repo.hash_files(&staging, &["SKILL.md"])?.remove(0);
+                files.insert("SKILL.md".into(), oid);
+            }
             let marker = Marker {
                 name: pkg.name.clone(),
                 reference: pkg.source.reference.clone(),
+                files: Some(files),
             };
             manifest::write_json(&staging.join(MARKER_FILE), &marker)?;
         }
@@ -1038,16 +1272,43 @@ fn stage(
     Ok(())
 }
 
-/// Replaces `dir/skill` with its staged export: the old folder is moved aside first, so the
+/// `skill_md` with `name:` in its frontmatter set to `alias`, so the harness lists the skill
+/// under its folder name. Adds the line, or a frontmatter block, if missing.
+// ponytail: line-based like `registry::description`; only the first frontmatter block is touched.
+fn rename_skill(skill_md: &str, alias: &str) -> String {
+    let name = format!("name: {alias}");
+    let mut lines = skill_md.split_inclusive('\n');
+    let Some(first) = lines.next().filter(|l| l.trim() == "---") else {
+        return format!("---\n{name}\n---\n{skill_md}");
+    };
+    let eol = if first.ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = format!("{first}{name}{eol}");
+    let mut in_frontmatter = true;
+    for line in lines {
+        if in_frontmatter && line.trim() == "---" {
+            in_frontmatter = false;
+        } else if in_frontmatter && line.starts_with("name:") {
+            continue; // replaced by the line above
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Replaces `dir/folder` with its staged export: the old folder is moved aside first, so the
 /// destination is never a mix of both.
-fn swap(dir: &Path, skill: &str) -> Result<()> {
-    let dest = dir.join(skill);
-    let aside = dir.join(format!(".{skill}.aip-old"));
+fn swap(dir: &Path, folder: &str) -> Result<()> {
+    let dest = dir.join(folder);
+    let aside = dir.join(format!(".{folder}.aip-old"));
     delete(&aside)?;
     if dest.symlink_metadata().is_ok() {
         fs::rename(&dest, &aside).context(|| format!("cannot replace {}", dest.display()))?;
     }
-    fs::rename(staging_path(dir, skill), &dest)
+    fs::rename(staging_path(dir, folder), &dest)
         .context(|| format!("cannot write {}", dest.display()))?;
     delete(&aside)
 }
@@ -1055,7 +1316,7 @@ fn swap(dir: &Path, skill: &str) -> Result<()> {
 /// Version labels for an update; equal versions (`dev-main`, or a re-pointed source) get the
 /// short commit added, like Composer: `dev-main 1a2b3c4 => dev-main 5d6e7f8`.
 fn update_labels(prev: &LockedPackage, next: &LockedPackage) -> (String, String) {
-    if prev.version != next.version {
+    if prev.version != next.version || prev.source == next.source {
         return (prev.version.clone(), next.version.clone());
     }
     let label = |p: &LockedPackage| format!("{} {}", p.version, short_sha(&p.source.reference));
@@ -1075,10 +1336,16 @@ fn delete(path: &Path) -> Result<()> {
     .context(|| format!("cannot remove {}", path.display()))
 }
 
-/// Skill folder name of a locked package, after validating the entry: lock files are
-/// user-editable input, and `reference` is passed to git as a revision.
-fn skill_of(pkg: &LockedPackage) -> Result<&str> {
+/// Skill folder name of a locked package (its `"as"`, else the skill's name), after validating
+/// the entry: lock files are user-editable input, and `reference` is passed to git as a revision.
+fn folder_of(pkg: &LockedPackage) -> Result<&str> {
     let (_, skill) = registry::split_package(&pkg.name)?;
+    if let Some(alias) = pkg.alias.as_deref().filter(|a| !registry::valid_name(a)) {
+        return Err(Error::new(format!(
+            "invalid {LOCK_FILE}: package {} has invalid \"as\" '{alias}'",
+            pkg.name
+        )));
+    }
     if pkg.path != format!("skills/{skill}") {
         return Err(Error::new(format!(
             "invalid {LOCK_FILE}: package {} has path '{}', expected 'skills/{skill}'",
@@ -1095,7 +1362,7 @@ fn skill_of(pkg: &LockedPackage) -> Result<&str> {
             pkg.name
         )));
     }
-    Ok(skill)
+    Ok(pkg.alias.as_deref().unwrap_or(skill))
 }
 
 /// Highest stable version of `skill`, else the default branch head: `(version label, commit sha)`.
@@ -1205,6 +1472,9 @@ struct Resolver {
     repos: HashMap<String, Repo>,
     /// URLs fetched in this run; other entries of `repos` are cached mirrors opened offline.
     fetched: HashSet<String>,
+    /// Package name to the URL aip.lock has for it; those lookups tolerate a broken
+    /// higher-priority registry when a lower one lists the locked URL.
+    locked_urls: HashMap<String, String>,
 }
 
 impl Resolver {
@@ -1214,6 +1484,7 @@ impl Resolver {
             cache: project.aip_home.join("cache").join("repos"),
             repos: HashMap::new(),
             fetched: HashSet::new(),
+            locked_urls: HashMap::new(),
         }
     }
 
@@ -1237,12 +1508,7 @@ impl Resolver {
     /// commit, so `aip install` from a lock works offline.
     fn locked_repo(&mut self, pkg: &LockedPackage) -> Result<&Repo> {
         let url = pkg.source.url.as_str();
-        if !self.repos.contains_key(url)
-            && let Some(repo) = Repo::open(url, &self.cache)?
-        {
-            self.repos.insert(url.to_string(), repo);
-        }
-        let mut matches = match self.repos.get(url) {
+        let mut matches = match self.mirror(url)? {
             Some(repo) => lock_matches(repo, pkg)?,
             None => false,
         };
@@ -1264,9 +1530,24 @@ impl Resolver {
         Ok(&self.repos[url])
     }
 
+    /// The repository of `url` as already synced or cached, without fetching; `None` if it was
+    /// never fetched.
+    fn mirror(&mut self, url: &str) -> Result<Option<&Repo>> {
+        if !self.repos.contains_key(url)
+            && let Some(repo) = Repo::open(url, &self.cache)?
+        {
+            self.repos.insert(url.to_string(), repo);
+        }
+        Ok(self.repos.get(url))
+    }
+
     fn url_of(&mut self, name: &str) -> Result<String> {
         let (repository, _) = registry::split_package(name)?;
-        Ok(self.registries.get(repository)?.url)
+        let entry = match self.locked_urls.get(name) {
+            Some(locked) => self.registries.get_locked(repository, locked)?,
+            None => self.registries.get(repository)?,
+        };
+        Ok(entry.url)
     }
 
     /// Constraint for `aip install <name>` without one: `^major.minor` of the latest stable
@@ -1289,12 +1570,29 @@ impl Resolver {
         let repo = self.repo(&url)?;
         let path = format!("skills/{skill}");
         let (version, sha, skill_md) = match &parsed {
-            Constraint::Branch(branch) => {
-                let sha = repo
-                    .resolve(&format!("refs/heads/{branch}"))?
-                    .ok_or_else(|| {
-                        Error::new(format!("{name}: branch '{branch}' not found in {url}"))
-                    })?;
+            Constraint::Branch {
+                name: branch,
+                commit,
+            } => {
+                let head = format!("refs/heads/{branch}");
+                let tip = repo.resolve(&head)?.ok_or_else(|| {
+                    Error::new(format!("{name}: branch '{branch}' not found in {url}"))
+                })?;
+                let sha = match commit {
+                    None => tip,
+                    Some(hex) => {
+                        let sha = repo.resolve(hex)?.ok_or_else(|| {
+                            Error::new(format!("{name}: commit {hex} not found in {url}"))
+                        })?;
+                        if !repo.is_ancestor(&sha, &head)? {
+                            return Err(Error::new(format!(
+                                "{name}: commit {} is not on branch {branch}",
+                                short_sha(&sha)
+                            )));
+                        }
+                        sha
+                    }
+                };
                 let version = format!("dev-{branch}");
                 let skill_md = repo
                     .read(&sha, &format!("{path}/SKILL.md"))?
@@ -1334,6 +1632,7 @@ impl Resolver {
             description: registry::description(&skill_md),
             source: Source::git(url, sha),
             path,
+            alias: None,
         })
     }
 }
@@ -1507,7 +1806,7 @@ mod tests {
         assert!(installed_version(&f).contains("version 1.1.0"));
         let manifest = f.manifest();
         assert_eq!(manifest.providers, ["claude-code"]);
-        assert_eq!(manifest.require["demo/hello"], "^1.0");
+        assert_eq!(manifest.require["demo/hello"].version, "^1.0");
         let lock = f.lock();
         assert_eq!(lock.packages[0].version, "1.1.0");
         assert_eq!(lock.packages[0].description.as_deref(), Some("Says hello"));
@@ -1538,7 +1837,7 @@ mod tests {
     fn default_constraint_is_caret_of_latest() {
         let f = Fixture::new("default");
         install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
-        assert_eq!(f.manifest().require["demo/hello"], "^2.0");
+        assert_eq!(f.manifest().require["demo/hello"].version, "^2.0");
         assert!(installed_version(&f).contains("version 2.0.0"));
     }
 
@@ -1563,7 +1862,8 @@ mod tests {
             [Change::Update {
                 name: "demo/hello".into(),
                 from: "1.1.0".into(),
-                to: "1.2.0".into()
+                to: "1.2.0".into(),
+                folder: None,
             }]
         );
         assert_eq!(
@@ -1699,8 +1999,8 @@ mod tests {
             Options::default(),
         )
         .unwrap();
-        assert_eq!(f.manifest().require["demo/other"], "^3.1");
-        assert_eq!(f.manifest().require["demo/hello"], "^2.0");
+        assert_eq!(f.manifest().require["demo/other"].version, "^3.1");
+        assert_eq!(f.manifest().require["demo/hello"].version, "^2.0");
         let lock = f.lock();
         assert_eq!(lock.get("demo/other").unwrap().version, "3.1.0");
         assert_eq!(lock.get("demo/hello").unwrap().version, "2.0.0");
@@ -1766,6 +2066,38 @@ mod tests {
         assert!(url.ends_with("repo"), "{url}");
         let registries = f.project.registries(Some(&f.manifest()));
         assert!(registries.get("demo").unwrap().url.ends_with("repo"));
+    }
+
+    #[test]
+    fn broken_registry_only_blocks_new_resolutions() {
+        let f = Fixture::new("broken-registry");
+        fs::write(
+            f.root.join("registry.json"),
+            r#"{"repositories": [{"name": "demo", "url": "repo"}, {"name": "new", "url": "repo"}]}"#,
+        )
+        .unwrap();
+        install(&f.project, &["demo/hello:^1.0".into()], Options::default()).unwrap();
+        fs::write(f.root.join("broken.json"), "{not json").unwrap();
+        let mut manifest = f.manifest();
+        manifest.registries.insert(
+            0,
+            crate::registry::RegistryConfig::Json(crate::registry::JsonSource::Path(
+                "../broken.json".into(),
+            )),
+        );
+        manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
+        fs::remove_dir_all(f.skill_dir()).unwrap();
+
+        // Locked from the second registry: warns and proceeds.
+        install(&f.project, &[], Options::default()).unwrap();
+        assert!(f.skill_dir().exists());
+        assert!(!matches!(check_one(&f).status, Status::Error { .. }));
+
+        // A new resolution would let the broken registry's higher priority go unnoticed.
+        let err = install(&f.project, &["new/hello".into()], Options::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has priority over"), "{err}");
     }
 
     #[test]
@@ -1862,7 +2194,7 @@ mod tests {
         let f = Fixture::new("late-skill");
         add_late(&f);
         install(&f.project, &["demo/late".into()], Options::default()).unwrap();
-        assert_eq!(f.manifest().require["demo/late"], "dev-main");
+        assert_eq!(f.manifest().require["demo/late"].version, "dev-main");
         assert_eq!(f.lock().get("demo/late").unwrap().version, "dev-main");
 
         let hit = search(&f.project, "late").unwrap().remove(0);
@@ -1995,6 +2327,30 @@ mod tests {
     }
 
     #[test]
+    fn latest_follows_the_constraint_stability_flag() {
+        assert_eq!(latest_query("^1.0"), "*");
+        assert_eq!(latest_query("^1.0@beta"), "*@beta");
+        assert_eq!(latest_query("^1.0 || ^2.0@RC"), "*@RC");
+    }
+
+    #[test]
+    fn check_latest_includes_prereleases_when_flagged() {
+        let f = Fixture::new("check-latest-beta");
+        write_skill(&f.repo, "hello", "2.1.0-beta.1");
+        commit(&f.repo, "beta");
+        git(&f.repo, &["tag", "v2.1.0-beta.1"]);
+        install(
+            &f.project,
+            &["demo/hello:^2.0@beta".into()],
+            Options::default(),
+        )
+        .unwrap();
+        let row = check_one(&f);
+        assert_eq!(row.latest.as_deref(), Some("2.1.0-beta.1"));
+        assert_eq!(row.status, Status::UpToDate);
+    }
+
+    #[test]
     fn check_reports_update_beyond_constraint() {
         let f = Fixture::new("check-update");
         // `~1.0.0` locks 1.0.0; widening the constraint to `^1.0` then allows 1.1.0.
@@ -2042,6 +2398,75 @@ mod tests {
         let f = Fixture::new("check-current");
         install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
         assert_eq!(check_one(&f).status, Status::UpToDate);
+    }
+
+    #[test]
+    fn commit_pin_locks_that_commit_and_survives_update() {
+        let f = Fixture::new("pin");
+        let pin = rev(&f.repo, "v1.1.0");
+        let spec = format!("demo/hello:dev-main#{}", &pin[..7]);
+        install(&f.project, &[spec], Options::default()).unwrap();
+        assert!(installed_version(&f).contains("version 1.1.0"));
+        let locked = f.lock().get("demo/hello").unwrap().clone();
+        assert_eq!(locked.version, "dev-main");
+        assert_eq!(locked.source.reference, pin);
+        assert_eq!(
+            f.manifest().require["demo/hello"].version,
+            format!("dev-main#{}", &pin[..7])
+        );
+
+        write_skill(&f.repo, "hello", "3.0.0-dev");
+        commit(&f.repo, "more");
+        update(&f.project, &[], Options::default()).unwrap();
+        assert_eq!(f.lock().get("demo/hello").unwrap().source.reference, pin);
+        let row = check_one(&f);
+        assert_eq!(row.status, Status::UpToDate);
+        assert_eq!(row.latest.unwrap(), rev(&f.repo, "main")[..7]);
+    }
+
+    #[test]
+    fn commit_pin_must_exist_and_be_on_the_branch() {
+        let f = Fixture::new("pin-errors");
+        git(&f.repo, &["checkout", "--quiet", "-b", "side", "v1.0.0"]);
+        write_skill(&f.repo, "hello", "9.9.9-side");
+        commit(&f.repo, "side");
+        let side = rev(&f.repo, "side");
+        git(&f.repo, &["checkout", "--quiet", "main"]);
+
+        let off_branch = format!("demo/hello:dev-main#{}", &side[..7]);
+        let err = install(&f.project, &[off_branch], Options::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("commit {} is not on branch main", &side[..7])),
+            "{err}"
+        );
+        let err = install(
+            &f.project,
+            &["demo/hello:dev-main#deadbee".into()],
+            Options::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("commit deadbee not found in"), "{err}");
+        assert!(!f.project.lock_path.exists());
+    }
+
+    #[test]
+    fn stability_flag_selects_prereleases() {
+        let f = Fixture::new("stability");
+        write_skill(&f.repo, "hello", "2.1.0-beta.1");
+        commit(&f.repo, "beta");
+        git(&f.repo, &["tag", "v2.1.0-beta.1"]);
+        install(&f.project, &["demo/hello:^2.0".into()], Options::default()).unwrap();
+        assert_eq!(f.lock().get("demo/hello").unwrap().version, "2.0.0");
+        install(
+            &f.project,
+            &["demo/hello:^2.0@beta".into()],
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(f.lock().get("demo/hello").unwrap().version, "2.1.0-beta.1");
     }
 
     #[test]
@@ -2140,9 +2565,14 @@ mod tests {
         let f = Fixture::new("marker");
         install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
         let sha = rev(&f.repo, "v2.0.0");
+        let blob = |path: &str| rev(&f.repo, &format!("v2.0.0:skills/hello/{path}"));
         assert_eq!(
             read(&f.skill_dir().join(MARKER_FILE)),
-            format!("{{\n    \"name\": \"demo/hello\",\n    \"reference\": \"{sha}\"\n}}\n")
+            format!(
+                "{{\n    \"name\": \"demo/hello\",\n    \"reference\": \"{sha}\",\n    \"files\": {{\n        \"SKILL.md\": \"{}\",\n        \"scripts/run.sh\": \"{}\"\n    }}\n}}\n",
+                blob("SKILL.md"),
+                blob("scripts/run.sh")
+            )
         );
         assert!(
             !f.project
@@ -2336,13 +2766,14 @@ mod tests {
         f.set_providers(&["claude-code", "codex"]);
         install(&f.project, &["demo/hello:^1.0".into()], Options::default()).unwrap();
         let old_marker = read(&f.agents_dir().join(MARKER_FILE));
+        let old_skill = read(&f.agents_dir().join("SKILL.md"));
         let mut manifest = f.manifest();
         manifest.require.insert("demo/hello".into(), "*".into());
         manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
         update(&f.project, &[], Options::default()).unwrap();
         // As if the swap into .agents/skills had failed: that folder still holds 1.1.0.
         fs::write(f.agents_dir().join(MARKER_FILE), old_marker).unwrap();
-        fs::write(f.agents_dir().join("SKILL.md"), "version 1.1.0").unwrap();
+        fs::write(f.agents_dir().join("SKILL.md"), old_skill).unwrap();
         assert_eq!(check_one(&f).status, Status::FolderOutdated);
 
         let report = install(&f.project, &[], Options::default()).unwrap();
@@ -2464,5 +2895,233 @@ mod tests {
         update(&f.project, &[], DRY_RUN).unwrap();
         assert_eq!(state(), before);
         assert_eq!(installed_version(&f), "kept");
+    }
+
+    fn modified(files: usize) -> Status {
+        Status::ModifiedLocally { files }
+    }
+
+    #[test]
+    fn local_edits_show_in_check_and_block_update() {
+        let f = Fixture::new("local-edits");
+        install(&f.project, &["demo/hello:^1.0".into()], Options::default()).unwrap();
+        assert_eq!(
+            check_one(&f).status,
+            Status::OutsideConstraint {
+                latest: "2.0.0".into()
+            }
+        );
+        fs::write(f.skill_dir().join("SKILL.md"), "edited").unwrap();
+        let row = check_one(&f);
+        assert_eq!(row.status, modified(1));
+        assert_eq!(row.to_string(), "modified locally (1 file)");
+        fs::write(f.skill_dir().join("notes.md"), "mine").unwrap();
+        fs::remove_file(f.skill_dir().join("scripts/run.sh")).unwrap();
+        assert_eq!(check_one(&f).status, modified(3));
+
+        let mut manifest = f.manifest();
+        manifest.require.insert("demo/hello".into(), "*".into());
+        manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
+        let lock_before = read(&f.project.lock_path);
+        let expected = format!(
+            "{} has local changes (3 files); use --force to discard them",
+            f.skill_dir().display()
+        );
+        for options in [Options::default(), DRY_RUN] {
+            let err = update(&f.project, &[], options).unwrap_err().to_string();
+            assert_eq!(err, expected);
+        }
+        assert_eq!(read(&f.project.lock_path), lock_before);
+        assert_eq!(installed_version(&f), "edited");
+
+        update(&f.project, &[], FORCE).unwrap();
+        assert!(installed_version(&f).contains("version 2.0.0"));
+        assert!(!f.skill_dir().join("notes.md").exists());
+        assert_eq!(check_one(&f).status, Status::UpToDate);
+    }
+
+    #[test]
+    fn local_edits_block_remove_and_pruning() {
+        let f = Fixture::new("local-edits-remove");
+        f.set_providers(&["claude-code", "codex"]);
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        fs::write(f.agents_dir().join("extra.md"), "mine").unwrap();
+        f.set_providers(&["claude-code"]);
+        let err = install(&f.project, &[], Options::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("has local changes (1 file); use --force to discard them"),
+            "{err}"
+        );
+        assert!(f.agents_dir().join("extra.md").exists());
+
+        fs::write(f.skill_dir().join("SKILL.md"), "edited").unwrap();
+        let err = remove(&f.project, &["demo/hello".into()], Options::default()).unwrap_err();
+        assert!(err.to_string().contains("has local changes"), "{err}");
+        assert!(f.skill_dir().exists() && f.agents_dir().exists());
+        assert!(f.manifest().require.contains_key("demo/hello"));
+
+        remove(&f.project, &["demo/hello".into()], FORCE).unwrap();
+        assert!(!f.skill_dir().exists() && !f.agents_dir().exists());
+    }
+
+    #[test]
+    fn old_markers_without_files_are_not_modified() {
+        let f = Fixture::new("old-marker");
+        install(&f.project, &["demo/hello:^1.0".into()], Options::default()).unwrap();
+        let path = f.skill_dir().join(MARKER_FILE);
+        let mut marker: Marker = serde_json::from_str(&read(&path)).unwrap();
+        marker.files = None;
+        manifest::write_json(&path, &marker).unwrap();
+        fs::write(f.skill_dir().join("SKILL.md"), "edited").unwrap();
+        assert!(matches!(
+            check_one(&f).status,
+            Status::OutsideConstraint { .. }
+        ));
+        update(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        // Unmodified folders with file ids are replaced without --force too.
+        let mut manifest = f.manifest();
+        manifest.require.insert("demo/hello".into(), "*".into());
+        manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
+        update(&f.project, &[], Options::default()).unwrap();
+        assert!(installed_version(&f).contains("version 2.0.0"));
+    }
+
+    /// A second repository `other` that also has a skill `hello`.
+    fn add_other_repo(f: &Fixture) {
+        let other = f.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "--quiet", "--initial-branch=main"]);
+        write_skill(&other, "hello", "other-1.0.0");
+        commit(&other, "other");
+        git(&other, &["tag", "v1.0.0"]);
+        fs::write(
+            f.root.join("registry.json"),
+            r#"{"repositories": [{"name": "demo", "url": "repo"}, {"name": "acme/other", "url": "other"}]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clashing_skill_names_need_an_alias() {
+        let f = Fixture::new("alias");
+        add_other_repo(&f);
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        let err = install(&f.project, &["acme/other/hello".into()], Options::default())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "demo/hello and acme/other/hello both install a skill named 'hello'\nhint: add \"as\" to one of them in aip.json, e.g. \"acme/other/hello\": {\"version\": \"^1.0\", \"as\": \"other-hello\"}"
+        );
+        assert!(!f.manifest().require.contains_key("acme/other/hello"));
+
+        let report = install_as(
+            &f.project,
+            &["acme/other/hello".into()],
+            Some("other-hello"),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(report.changes.len(), 1);
+        let folder = f.project.root.join(".claude/skills/other-hello");
+        let skill_md = read(&folder.join("SKILL.md"));
+        assert!(
+            skill_md.starts_with("---\nname: other-hello\ndescription: Says hello\n---\n"),
+            "{skill_md}"
+        );
+        assert!(skill_md.contains("version other-1.0.0"));
+        assert!(installed_version(&f).contains("version 2.0.0"));
+        assert_eq!(
+            f.manifest().require["acme/other/hello"],
+            Requirement {
+                version: "^1.0".into(),
+                alias: Some("other-hello".into())
+            }
+        );
+        assert!(read(&f.project.manifest_path).contains(
+            "\"acme/other/hello\": {\n            \"version\": \"^1.0\",\n            \"as\": \"other-hello\"\n        },"
+        ));
+        assert_eq!(
+            f.lock().get("acme/other/hello").unwrap().alias.as_deref(),
+            Some("other-hello")
+        );
+        assert!(
+            check(&f.project)
+                .unwrap()
+                .iter()
+                .all(|r| r.status == Status::UpToDate)
+        );
+        assert!(
+            install(&f.project, &[], Options::default())
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        // Naming the package again keeps its alias.
+        install(&f.project, &["acme/other/hello".into()], Options::default()).unwrap();
+        assert!(f.manifest().require["acme/other/hello"].alias.is_some());
+    }
+
+    #[test]
+    fn as_needs_one_valid_package() {
+        let f = Fixture::new("alias-args");
+        let err = |specs: &[&str], alias: &str| {
+            let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+            install_as(&f.project, &specs, Some(alias), Options::default())
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err(&["demo/hello", "demo/other"], "x"),
+            "--as needs exactly one package"
+        );
+        assert_eq!(err(&[], "x"), "--as needs exactly one package");
+        assert!(err(&["demo/hello"], "../x").starts_with("invalid --as '../x'"));
+    }
+
+    #[test]
+    fn changing_alias_moves_the_folder() {
+        let f = Fixture::new("alias-move");
+        install(&f.project, &["demo/hello".into()], Options::default()).unwrap();
+        let moved = f.project.root.join(".claude/skills/greet");
+        let set_alias = |alias: Option<&str>| {
+            let mut manifest = f.manifest();
+            manifest.require.get_mut("demo/hello").unwrap().alias = alias.map(str::to_string);
+            manifest::write_json(&f.project.manifest_path, &manifest).unwrap();
+        };
+        set_alias(Some("greet"));
+        assert_eq!(check_one(&f).status, Status::FolderMissing);
+        let report = install(&f.project, &[], Options::default()).unwrap();
+        assert_eq!(
+            report.changes[0].to_string(),
+            "Updating demo/hello (2.0.0 => 2.0.0, folder hello => greet)"
+        );
+        assert!(!f.skill_dir().exists());
+        assert!(read(&moved.join("SKILL.md")).contains("name: greet\n"));
+        assert_eq!(check_one(&f).status, Status::UpToDate);
+
+        // Moving back refuses to drop local changes.
+        fs::write(moved.join("notes.md"), "mine").unwrap();
+        set_alias(None);
+        let err = install(&f.project, &[], Options::default()).unwrap_err();
+        assert!(err.to_string().contains("has local changes"), "{err}");
+        assert!(moved.exists() && !f.skill_dir().exists());
+        install(&f.project, &[], FORCE).unwrap();
+        assert!(!moved.exists());
+        assert!(installed_version(&f).contains("name: hello\n"));
+    }
+
+    #[test]
+    fn rename_skill_sets_the_frontmatter_name() {
+        assert_eq!(
+            rename_skill("---\nname: a\nx: 1\n---\nname: body\n", "b"),
+            "---\nname: b\nx: 1\n---\nname: body\n"
+        );
+        assert_eq!(
+            rename_skill("---\r\nx: 1\r\n---\r\n", "b"),
+            "---\r\nname: b\r\nx: 1\r\n---\r\n"
+        );
+        assert_eq!(rename_skill("plain", "b"), "---\nname: b\n---\nplain");
     }
 }

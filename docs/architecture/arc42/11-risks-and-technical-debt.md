@@ -1,7 +1,7 @@
 # 11 Risks and technical debt
 
 Purpose: known limits and shortcuts.
-Items 1 to 3, 25 and 26 are marked in the code with `ponytail:` comments.
+Items 1 to 3, 25, 26 and 28 are marked in the code with `ponytail:` comments.
 
 ## Marked in code (`ponytail:`)
 
@@ -18,7 +18,7 @@ Items 1 to 3, 25 and 26 are marked in the code with `ponytail:` comments.
 | 4 | Resolved: ownership is recorded per folder in `.aip-package`. Folders of providers no longer in `aip.json` are pruned, and `remove` deletes from every provider's folder. A provider added over a user's own folder is refused without `--force`. | None. |
 | 5 | `search` fetches every repository of every registry on every call, then reads each skill. | Slow with many or large repositories; needs network. A server registry could answer this directly. |
 | 6 | Skill folder paths for several providers (Copilot `.github/skills` and `~/.copilot/skills`, Cursor, Gemini CLI, OpenCode, `.agents/skills`) come from community docs and are not vendor-confirmed. | Skills may land where the harness does not look. Change `PROVIDERS` in `detect.rs`. |
-| 7 | `detect --global` honours `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, but `install --global` does not. | A relocated Claude or Codex config shows as detected while skills go to `~/.claude/skills` or `~/.agents/skills`. |
+| 7 | Resolved: `Provider.global_env` names a config-home variable (`CLAUDE_CONFIG_DIR`, `COPILOT_HOME`, `GEMINI_CLI_HOME`, `CODEX_HOME`). Global detection and global skill folders resolve through `detect::scoped_path`. Codex skills stay in `~/.agents/skills`, as documented. | None. |
 | 8 | Resolved: `verify_sources` compares every locked `source.url` with the registries before planning. `source.reference` is validated as a 40- or 64-character hex commit SHA. | None. |
 | 9 | Resolved: `Repo::export` rejects tree paths with empty, `.`, `..`, `\` or `:` components before writing. | None. |
 | 10 | Partly resolved: all exports are staged before aip.json and aip.lock are written, so a failed export changes nothing. The swaps after that are not atomic as a group. | A crash during the swaps leaves some folders at the old version, or with `.<skill>.aip-old` beside them. Their markers show it: `aip check` reports `folder out of date`, and `aip install` repairs it. |
@@ -39,6 +39,9 @@ Items 1 to 3, 25 and 26 are marked in the code with `ponytail:` comments.
 | 25 | `ops::installed_before_markers` adopts a folder without a marker if its `SKILL.md` matches the old locked commit. Other files are not compared. | A user folder with an unchanged `SKILL.md` but edited other files can be overwritten once, without `--force`. Remove the rule once installs without markers are gone. |
 | 26 | `ops::finish`: the swaps after the lock is written are not atomic as a group (item 10). | See item 10. |
 | 27 | A provider's skill folder behind a symbolic link is an error if the provider is in `aip.json`, and silently not scanned for pruning if it is not. | Copies there are not pruned. |
+| 28 | `ops::rename_skill` rewrites `name:` line by line in the first frontmatter block, like `description` (item 3). | A multi-line or indented `name:` value is not replaced cleanly. |
+| 29 | Local-change detection compares file content and the set of files, not the executable bit. Folders installed before markers had `files` are never reported as modified. | A `chmod` alone is not detected. Such folders can be overwritten without `--force` until they are reinstalled once. |
+| 30 | A rename or `"as"` swap between packages from different repository URLs does not take over the other package's folder. | `install` refuses with `not installed by aip`; doing it in two steps, or `--force`, works. |
 
 ## Risks
 

@@ -19,6 +19,7 @@ It works like Composer: you list what you need in `aip.json`, aip resolves versi
 - [Offline use and the registry cache](#offline-use-and-the-registry-cache)
 - [Environment variables](#environment-variables)
 - [Safety: unmanaged folders and --force](#safety-unmanaged-folders-and---force)
+- [Two skills with the same name](#two-skills-with-the-same-name)
 - [Troubleshooting](#troubleshooting)
 
 ## Install aip
@@ -152,11 +153,16 @@ Detected 1 provider in global config (/home/me):
 
 If nothing matches: `No AI providers detected in <location>.`
 
-With `--global`, a provider can also be detected through an environment variable.
-`CLAUDE_CONFIG_DIR` (Claude Code) and `CODEX_HOME` (Codex) count when they point to an existing directory.
-The marker is then shown as `$CLAUDE_CONFIG_DIR` or `$CODEX_HOME`.
-This only affects detection.
-`aip install --global` always writes to `~/.claude/skills` and `~/.agents/skills`, not to the relocated directory.
+With `--global`, some providers honour a variable that moves their user-level config folder.
+Detection and `aip install --global` both use the moved folder, so skills land where the tool looks for them.
+An unset, empty or relative value is ignored, and aip uses your home folder.
+
+| Variable | Provider | Global skill folder |
+|---|---|---|
+| `CLAUDE_CONFIG_DIR` | Claude Code | `$CLAUDE_CONFIG_DIR/skills` |
+| `COPILOT_HOME` | GitHub Copilot | `$COPILOT_HOME/skills` |
+| `GEMINI_CLI_HOME` | Gemini CLI | `$GEMINI_CLI_HOME/.gemini/skills` |
+| `CODEX_HOME` | OpenAI Codex | Not moved, because Codex reads skills from `~/.agents/skills`. Only detection uses it. |
 
 ### aip search
 
@@ -227,6 +233,7 @@ The first status that applies is shown:
 | `source changed` | The locked URL differs from the registry URL. Run `aip update <name>`. |
 | `folder missing` | A skill folder of a provider lacks the skill. Run `aip install`. |
 | `folder out of date` | A skill folder holds another commit than the lock, for example after a failed run, or was installed before aip wrote `.aip-package` markers. Run `aip install`. |
+| `modified locally (2 files)` | Files in a skill folder were edited, added or deleted since aip installed it. The count is for the folder with the most changes. `update` and `remove` refuse to discard the changes without `--force`; see [Local changes](#local-changes). |
 | `new commits: 1a2b3c4` | A `dev-<branch>` skill has a newer commit. Run `aip update`. |
 | `update available: 1.1.0` | A newer version fits the constraint. Run `aip update`. |
 | `update available: 1.1.0 (2.0.0 outside constraint)` | Same, and an even newer version needs a changed constraint. |
@@ -235,9 +242,11 @@ The first status that applies is shown:
 | `error (see below)` | aip could not resolve this skill, for example because its repository is unreachable. The details are printed below the table as `error: <package>: <message>`, and the other rows are still shown. |
 
 On a terminal the status is colored (green, yellow, red); `NO_COLOR` turns that off.
+`modified locally` is red, and below the table aip prints `Local changes in <packages> will block update/remove; use --force to discard them.`
 Below the table, aip prints error details and every next step that applies, such as `aip install`, `aip update`, or widening a constraint.
 If everything is current it prints `All skills are up to date.`
 `--json` prints an array with `name`, `constraint`, `installed`, `latest` and `status` (an object with a `state` field).
+For local changes, `status` is `{"state": "modified-locally", "files": 2}`.
 
 Exit status: `aip check` exits with 1 when any row is `error (see below)`, and with 0 otherwise.
 With `--strict` it also exits with 1 when any row is not `up to date`, which makes it usable as a CI gate.
@@ -246,7 +255,7 @@ The exit status is the same with `--json`.
 ### aip install
 
 ```sh
-aip install [<repository>/<skill>[:<constraint>]...] [-g] [--force] [--dry-run]
+aip install [<repository>/<skill>[:<constraint>]...] [--as <folder>] [-g] [--force] [--dry-run]
 ```
 
 With packages, aip adds them to `aip.json` (creating the file if needed), resolves them and installs them.
@@ -283,7 +292,10 @@ $ aip install anthropics/skills/pdf:^1.2 anthropics/skills/xlsx:dev-main
 
 When nothing needs to change: `Nothing to install, update or remove`.
 With `--global`, folders are shown as `~/.claude/skills`.
-`--force` replaces folders that aip did not install; see [Safety](#safety-unmanaged-folders-and---force).
+`--force` replaces folders that aip did not install, and folders of aip with local changes; see [Safety](#safety-unmanaged-folders-and---force).
+`--as <folder>` installs the one package you name into a folder of that name, for example to install two skills that have the same name; see [Two skills with the same name](#two-skills-with-the-same-name).
+It is an error with more or fewer than one package.
+Naming an aliased package again without `--as` keeps its folder.
 `--dry-run` prints the same `Package operations` list, after the line `Dry run: nothing was changed.`, and writes nothing: no `aip.json`, no `aip.lock`, no skill folders.
 
 ### aip update
@@ -306,11 +318,12 @@ Skill folders: .claude/skills, .agents/skills
 The verb is `Upgrading`, `Downgrading` or `Updating` (for branch constraints, where versions cannot be compared).
 For `dev-<branch>` constraints, `update` moves the lock to the current head of the branch.
 The change shows the short commits, for example `Updating anthropics/skills/xlsx (dev-main 1a2b3c4 => dev-main 5d6e7f8)`.
+`update` refuses to overwrite a skill folder with local changes; `--force` discards them.
 
 ### aip remove
 
 ```sh
-aip remove <repository>/<skill>... [-g] [--dry-run]
+aip remove <repository>/<skill>... [-g] [--force] [--dry-run]
 ```
 
 Removes packages from `aip.json` and `aip.lock` and deletes their skill folders from the skill folder of every known provider, also of providers that are not in `aip.json`.
@@ -324,7 +337,8 @@ Package operations: 0 installs, 0 updates, 1 removal
 Skill folders: .claude/skills, .agents/skills
 ```
 
-`remove` has no `--force`.
+`remove` refuses to delete a skill folder with local changes; `--force` deletes it anyway.
+`--force` never deletes a folder that aip did not install.
 `--dry-run` works as for `install`.
 
 The summary line pluralises by count: "1 install", "0 installs", "1 removal".
@@ -341,7 +355,8 @@ The summary line pluralises by count: "1 install", "0 installs", "1 removal".
     "providers": ["claude-code", "codex"],
     "require": {
         "anthropics/skills/pdf": "^1.2",
-        "anthropics/skills/xlsx": "dev-main"
+        "anthropics/skills/xlsx": "dev-main",
+        "acme/skills/pdf": { "version": "^2.0", "as": "acme-pdf" }
     }
 }
 ```
@@ -355,10 +370,15 @@ The summary line pluralises by count: "1 install", "0 installs", "1 removal".
   Providers without skills support are skipped with a warning.
 - `require` maps package names to constraints.
   aip keeps it sorted.
+  A value can also be an object `{"version": "<constraint>", "as": "<folder>"}`: `as` is the name of the skill folder, instead of the skill's own name.
+  `as` uses the same characters as skill names (lowercase letters, digits, `.`, `_`, `-`).
+  Other keys in the object are an error.
+  aip writes a requirement without `as` back as a plain string.
 - Other keys are kept unchanged when aip rewrites the file.
 - aip rewrites the file with four-space indentation.
 
-`aip.lock` contains for each package: `name`, `version`, `description` (if any), `source` (`type: git`, `url`, `reference` = commit SHA) and `path`.
+`aip.lock` contains for each package: `name`, `version`, `description` (if any), `source` (`type: git`, `url`, `reference` = commit SHA), `path` and, for a requirement with `as`, `as`.
+`path` is always `skills/<skill>` in the repository; `as` only changes the folder name on disk.
 aip rewrites it only when the content changes.
 
 A repository on the local file system has a path as its URL.
@@ -390,6 +410,8 @@ Constraints use Composer notation.
 | `1.0 - 2.0` | `>=1.0.0 <2.1.0` (a partial upper bound includes everything it prefixes) |
 | `1.0.0 - 2.1.0` | `>=1.0.0 <=2.1.0` |
 | `dev-main` | latest commit of branch `main` |
+| `dev-main#1a2b3c4` | commit `1a2b3c4`, which must be on branch `main` |
+| `^1.0@beta`, `>=1.0 <2.0@rc`, `@beta` | range that also accepts pre-releases of at least that stability (`@beta` alone means `*@beta`) |
 
 Tilde follows Composer, not Cargo.
 `~1.2` allows `1.9.0`; in Cargo it would stop at `1.3.0`.
@@ -403,7 +425,24 @@ The default constraint and `search` ignore pre-releases.
 
 Branch constraints (`dev-<branch>`) match no tag.
 They resolve to the head commit of the branch and lock to that commit.
-Branch names with spaces, control characters, `~ ^ : ? * [ \`, a leading `-` or `..` are rejected.
+Branch names with spaces, control characters, `~ ^ : ? * [ \ #`, a leading `-` or `..` are rejected.
+
+A commit pin (`dev-<branch>#<commit>`) locks one commit of the branch.
+The commit is 7 to 64 hexadecimal digits (upper case is converted to lower case) and can be abbreviated.
+aip stops with `<package>: commit <hex> not found in <url>` if no single commit matches, and with `<package>: commit <short> is not on branch <branch>` if the commit is not in the history of the branch.
+The lock file keeps the version `dev-<branch>` and the full commit.
+`aip update` keeps the pin.
+`aip check` reports a pinned package as `up to date` when the lock has the pinned commit, and shows the current head of the branch in the Latest column.
+`aip install <package>:dev-main#1a2b3c4` writes the pin to `aip.json`.
+
+Stability flags: add `@dev`, `@alpha`, `@beta`, `@RC` or `@stable` (not case-sensitive) to a range to accept pre-releases that are at least that stable.
+The flag applies to every alternative of the constraint, and a constraint can be only a flag (`@beta` is `*@beta`).
+The stability of a version is `stable` if it has no pre-release part.
+Otherwise the first pre-release identifier decides: `rc...` is RC, `beta...` or `b`, `b<digit>` is beta, `alpha...` or `a`, `a<digit>` is alpha, and anything else (`dev`, numbers) is dev.
+The order is dev, alpha, beta, RC, stable.
+`^1.0@beta` accepts `1.2.0-beta.1` and `1.2.0-rc1`, but not `1.2.0-alpha` or `2.0.0-beta` (the upper bound still excludes pre-releases of `2.0.0`).
+`@stable` is the default.
+A flag on a branch constraint is an error.
 
 Tags are read as versions after removing a leading `v` or `V` and any `+build` part.
 `1`, `1.2` and `1.2.3` are accepted and padded with zeros.
@@ -531,6 +570,19 @@ Setting both, neither, or a URL in `path` is an error.
 List several registries in `aip.json`.
 If two list the same repository name, the first registry in the list wins.
 Repositories that only a later registry lists are still available.
+
+A registry that cannot be loaded (unreachable, or not valid JSON) never silently hands its names to a lower registry, because that would let a lower registry supply a different URL for the same name.
+aip handles it like this:
+
+- `aip search` skips the broken registry and prints `warning: skipping registry <location>: <reason>`.
+- A package that a lower registry lists, while a broken registry has priority over it, fails with `cannot resolve '<name>': registry <location> is unavailable (<reason>) and has priority over <location>, which lists it; fix or remove the broken registry`.
+- If `aip.lock` already has that package with exactly the URL the lower registry lists, aip prints `warning: registry <location> is unavailable (<reason>); using <location> for '<name>' because it matches aip.lock` and proceeds.
+  This keeps `aip install` and `aip check` working for locked packages.
+  Resolving a new package, or one whose URL is not in `aip.lock`, still fails.
+- An invalid entry in a registry is skipped with a warning, but that registry still claims its name.
+  Asking for that repository fails with `repository '<name>' in registry <location> is invalid: <reason>`, and a lower registry is not consulted.
+- If one registry lists a name twice, neither entry is used: the name becomes invalid (`name is listed more than once`) and a lower registry is not consulted.
+  Across different registries, the first registry in the list wins.
 
 ## Private repositories
 
@@ -691,8 +743,7 @@ To clear the registry cache, delete the folder `$AIP_HOME/cache/registries`.
 |---|---|
 | `AIP_HOME` | aip's own folder. Default `~/.aip`. Holds `registry.json`, `auth.json`, the repository cache (`cache/repos`), the registry cache (`cache/registries`) and, for `--global`, `aip.json` and `aip.lock`. |
 | `AIP_AUTH` | Credentials for HTTP registries, as JSON text in the `auth.json` format. Highest precedence. See [Private registries](#private-registries). |
-| `CLAUDE_CONFIG_DIR` | Only for `aip detect --global`: counts as a Claude Code marker if it names an existing directory. |
-| `CODEX_HOME` | Only for `aip detect --global`: same for Codex. |
+| `CLAUDE_CONFIG_DIR`, `COPILOT_HOME`, `GEMINI_CLI_HOME`, `CODEX_HOME` | Move the user-level config folder of the provider, for `--global`: `aip detect --global` looks there, and global skills are installed there. Absolute paths only. See [aip detect](#aip-detect). |
 | `HOME` / `USERPROFILE` | Used to find your home folder (Unix / Windows). |
 
 An empty `AIP_HOME` is treated as unset.
@@ -710,15 +761,37 @@ Every skill folder that aip installs contains a file `.aip-package`:
 ```json
 {
     "name": "anthropics/skills/pdf",
-    "reference": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+    "reference": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+    "files": {
+        "SKILL.md": "3b18e512dba79e4c8300dd08aeb37f8e728b8dad",
+        "scripts/run.sh": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    }
 }
 ```
 
-It names the package and the commit in the folder.
+It names the package, the commit in the folder and the git blob id of every file aip wrote.
 aip treats a folder as its own only if the marker names the package.
 It does not use `aip.lock` for this, because a lock can be edited or come from someone else.
 Do not edit or copy the marker.
-If you change a skill by hand, delete its marker, so that aip does not replace your change without `--force`.
+If you change a skill by hand and want to keep the change for good, delete its marker, so that aip treats the folder as yours.
+
+### Local changes
+
+aip compares a folder with the `files` of its marker to find local changes: an edited file, a deleted file, or a new file (other than `.aip-package`).
+It hashes the files with `git hash-object`, in the format of the cached repository, so it works for SHA-1 and SHA-256 repositories.
+`aip check` shows such a folder as `modified locally (<n> files)`.
+`aip install`, `aip update` and `aip remove` check every folder of aip that they are about to overwrite or delete, also copies in the folders of removed providers.
+If one has local changes, they stop before they change anything:
+
+```
+error: .claude/skills/pdf has local changes (1 file); use --force to discard them
+```
+
+`--force` replaces or deletes the folder, and the changes are lost.
+`--dry-run` reports the same error.
+A folder that stays as it is is not hashed, so `aip install` with nothing to do stays fast.
+Markers written by older aip versions have no `files`; aip treats those folders as unmodified.
+Without a cached repository, aip can still check SHA-1 ids; it treats SHA-256 ids as unknown, so as unmodified.
 
 ### Folders aip did not install
 
@@ -733,7 +806,7 @@ This also applies when you add a provider whose skill folder already has a folde
 `--force` (on `install` and `update`) replaces the folder.
 aip never deletes a folder without a matching marker, also not with `--force`.
 It skips it with `warning: not removing <path>: it was not installed by aip`.
-Two packages that would install the same skill name (for example `a/pdf` and `b/pdf`) are rejected, because skill folders are named by skill only.
+Two packages that would install the same folder are rejected; see [Two skills with the same name](#two-skills-with-the-same-name).
 
 Folders installed by aip versions without markers are adopted once: aip rewrites such a folder (with a marker) if `aip.lock` lists the package and the folder's `SKILL.md` is the one at the locked commit.
 If you changed that `SKILL.md`, aip asks for `--force`.
@@ -746,6 +819,7 @@ If the new name points to a different repository URL, aip refuses as for any oth
 ### Removed providers
 
 When you remove a provider from `aip.json`, the next `install`, `update` or `remove` deletes the copies aip installed in that provider's skill folder.
+A copy with local changes stops the run, as described in [Local changes](#local-changes).
 The output lists them as `Removing <package> from <folder>`.
 aip looks in the skill folders of all providers it knows, and deletes only folders with a marker for a package of the lock.
 
@@ -774,6 +848,26 @@ If a swap fails after that, `aip check` shows `folder out of date` and `aip inst
 
 `--dry-run` on `install`, `update` and `remove` shows what would change and writes nothing.
 It still fetches repositories into the cache, as a normal run would.
+
+## Two skills with the same name
+
+A skill folder is named after the skill, so `a/tools/pdf` and `b/skills/pdf` would both install `pdf`.
+aip refuses that and suggests an alias:
+
+```
+error: a/tools/pdf and b/skills/pdf both install a skill named 'pdf'
+hint: add "as" to one of them in aip.json, e.g. "b/skills/pdf": {"version": "^1.0", "as": "skills-pdf"}
+```
+
+The suggestion is the last segment of the repository name, a `-`, and the skill name.
+Use the object form in `aip.json`, or `aip install b/skills/pdf --as skills-pdf`.
+aip then installs that package into `skills-pdf` and sets `name:` in the first frontmatter block of its `SKILL.md` to `skills-pdf`, so the harness lists it under that name.
+If `SKILL.md` has no `name:` line, aip adds one; if it has no frontmatter, aip adds a frontmatter block.
+The marker records the rewritten file, so `aip check` does not show it as a local change.
+
+When you add, change or remove `as`, the next `aip install` moves the skill: it installs the new folder and deletes the old one, if aip installed it and it has no local changes.
+The output shows this as an update, for example `Updating b/skills/pdf (1.0.0 => 1.0.0, folder pdf => skills-pdf)`.
+A changed `as` does not need `aip update`, because the version stays the same.
 
 ## Troubleshooting
 
@@ -813,7 +907,9 @@ Messages are shown as `error: <message>`.
 | Message | Meaning and fix |
 |---|---|
 | `invalid package name '<name>' (expected <repository>/<skill>, e.g. owner/repo/skill, using lowercase letters, digits, '.', '_', '-')` | Name has uppercase letters, an empty or `..` segment, or a segment with a leading `.`/`-`. |
-| `invalid version constraint '<input>': <reason>` (prefixed with `<package>: ` when it comes from install/update) | Constraint syntax error: empty, bad number, operator without version, bad branch name. See the table above. |
+| `invalid version constraint '<input>': <reason>` (prefixed with `<package>: ` when it comes from install/update) | Constraint syntax error: empty, bad number, operator without version, bad branch name, bad commit pin (not 7 to 64 hexadecimal digits), unknown stability flag. See the table above. |
+| `<package>: commit <hex> not found in <url>` | The commit of a `dev-<branch>#<commit>` pin does not exist, or an abbreviation matches more than one commit. Use more digits. |
+| `<package>: commit <short> is not on branch <branch>` | The pinned commit exists but is not in the history of the branch. |
 | `<package>: no version matches '<constraint>' (available: <list>)` | No tag satisfies the constraint. Pre-releases are excluded unless named. `available: none` means no version tags; use `dev-<branch>`. |
 | `<package>: branch '<branch>' not found in <url>` | The `dev-` branch does not exist in the repository. |
 | `<package>: skill '<skill>' not found in <url> at <version> (expected skills/<skill>/SKILL.md)` | The skill does not exist at that version. Check the name and tag. |
@@ -822,7 +918,10 @@ Messages are shown as `error: <message>`.
 | `repository '<name>' in <registry>: URL must not start with '-'` | A registry entry has a URL that git could read as an option. Fix the URL. |
 | `tag '<tag>' does not point to a commit` | The tag is broken. Ask the repository owner. |
 | `default branch '<branch>' has no commits` | Empty repository. |
-| `<a> and <b> both install a skill named '<skill>'` | Two packages share a skill name. Remove one. |
+| `<a> and <b> both install a skill named '<skill>'` | Two packages would install the same folder. Add `"as"` to one of them, as the `hint:` line shows; see [Two skills with the same name](#two-skills-with-the-same-name). |
+| `--as needs exactly one package` | `aip install --as` names the folder of one package. Install the others in a separate command. |
+| `invalid --as '<folder>' (use lowercase letters, digits, '.', '_', '-')` / `invalid "as" '<folder>' ...` (in `invalid aip.json: ...`) | The folder name has other characters. Choose another name. |
+| `invalid aip.lock: package <name> has invalid "as" '<folder>'` | The lock was edited or is corrupt. Delete it and run `aip install`. |
 
 ### Registries
 
@@ -867,6 +966,7 @@ Messages are shown as `error: <message>`.
 | Message | Meaning and fix |
 |---|---|
 | `refusing to overwrite <path>: it was not installed by aip (use --force to replace it)` | See [Safety](#safety-unmanaged-folders-and---force). Move the folder away, or use `--force`. |
+| `<path> has local changes (<n> files); use --force to discard them` | Files in a folder that aip installed were changed, and `install`, `update` or `remove` would overwrite or delete it. Copy your changes elsewhere, or use `--force` to discard them. See [Local changes](#local-changes). |
 | `warning: not removing <path>: it was not installed by aip` | The folder has no `.aip-package` marker for the removed package, so aip leaves it alone. Delete it yourself if you do not need it. |
 | `refusing to use <dir>: <path> is a symbolic link` | A project skill folder is reached through a symbolic link. See [Symbolic links](#symbolic-links). |
 | `aip.lock: <name> <version> is locked to commit <sha>, which is not tagged <version> in <url>; run ...` | The commit in `aip.lock` is not the one of the version's tag (or, for `dev-<branch>`, not on the branch). The lock was edited, or the tag was moved. Review the lock change, then run `aip update <name>`. |

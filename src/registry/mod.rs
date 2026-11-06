@@ -13,7 +13,8 @@ pub use json::{JsonRegistry, JsonSource};
 use crate::auth::Auth;
 use crate::{Context, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashSet;
 use std::path::{self, Component, Path, PathBuf};
 
 /// A repository listed in a registry.
@@ -42,12 +43,87 @@ impl RawEntry {
     }
 }
 
+/// A repository entry that failed validation. Its name, when known, stays claimed by the registry.
+#[derive(Debug, Clone)]
+pub struct Invalid {
+    /// Explicit name, or the name derived from the URL.
+    pub name: Option<String>,
+    /// `repository 'x'` or `repository`; never contains the URL.
+    pub label: String,
+    pub reason: String,
+}
+
+/// What one registry lists: usable entries plus entries that were skipped.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub entries: Vec<Entry>,
+    pub invalid: Vec<Invalid>,
+}
+
+impl Listing {
+    /// Validates `raws` with `check`. An invalid entry is recorded with its (explicit or derived)
+    /// name, so the registry still claims that name; a name listed twice is dropped and claimed.
+    pub(crate) fn collect(
+        raws: Vec<RawEntry>,
+        mut check: impl FnMut(&RawEntry) -> std::result::Result<Entry, String>,
+    ) -> Self {
+        let mut listing = Self::default();
+        for raw in raws {
+            match check(&raw) {
+                Ok(entry) => listing.entries.push(entry),
+                Err(reason) => {
+                    let name = raw.name.clone().or_else(|| derive_name(&raw.url).ok());
+                    listing.invalid.push(Invalid {
+                        name,
+                        label: raw.label(),
+                        reason,
+                    });
+                }
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut duplicated: Vec<String> = Vec::new();
+        for entry in &listing.entries {
+            if seen.contains(&entry.name) {
+                if !duplicated.contains(&entry.name) {
+                    duplicated.push(entry.name.clone());
+                }
+            } else {
+                seen.push(entry.name.clone());
+            }
+        }
+        listing.entries.retain(|e| !duplicated.contains(&e.name));
+        for name in duplicated {
+            listing.invalid.push(Invalid {
+                label: format!("repository '{name}'"),
+                name: Some(name),
+                reason: "name is listed more than once".to_string(),
+            });
+        }
+        listing
+    }
+}
+
 /// A source of skill repositories (JSON file or URL now; HTTP server later).
 pub trait Registry {
     /// Path or URL, for messages.
     fn location(&self) -> String;
-    /// Repositories this registry lists, with git URLs ready for `git clone`.
-    fn repositories(&self) -> Result<Vec<Entry>>;
+    /// Repositories this registry lists, with git URLs ready for `git clone`. Fails only when
+    /// the registry as a whole is unusable (unreadable, malformed document).
+    fn listing(&self) -> Result<Listing>;
+    /// Strict variant: also fails on the first invalid entry.
+    fn repositories(&self) -> Result<Vec<Entry>> {
+        let listing = self.listing()?;
+        match listing.invalid.first() {
+            Some(bad) => Err(Error::new(format!(
+                "{} in {}: {}",
+                bad.label,
+                self.location(),
+                bad.reason
+            ))),
+            None => Ok(listing.entries),
+        }
+    }
 }
 
 /// What registries need besides their own configuration.
@@ -87,29 +163,113 @@ impl RegistryConfig {
     }
 }
 
+type Loaded = std::result::Result<Listing, String>;
+
 /// Ordered set of registries; the first registry listing a repository name wins
-/// (like Composer repository priority). Registries are read on first use.
+/// (like Composer repository priority). Registries are read on first use, each at most once.
+///
+/// A registry that fails to load never lets a lower-priority registry answer for a name it
+/// might have listed: that registry could supply a different URL (dependency confusion).
 pub struct Registries {
     registries: Vec<Box<dyn Registry>>,
+    loaded: Vec<OnceCell<Loaded>>,
     entries: OnceCell<Vec<Entry>>,
+    warned: RefCell<HashSet<String>>,
 }
 
 impl Registries {
     pub fn new(registries: Vec<Box<dyn Registry>>) -> Self {
         Self {
+            loaded: registries.iter().map(|_| OnceCell::new()).collect(),
             registries,
             entries: OnceCell::new(),
+            warned: RefCell::new(HashSet::new()),
         }
     }
 
-    /// The repository called `name`, from the first registry that lists it.
-    pub fn get(&self, name: &str) -> Result<Entry> {
-        let entries = self.entries()?;
-        if let Some(entry) = entries.iter().find(|e| e.name == name) {
-            return Ok(entry.clone());
+    fn warn(&self, message: String) {
+        if self.warned.borrow_mut().insert(message.clone()) {
+            eprintln!("{message}");
         }
+    }
+
+    /// The listing of registry `i`, loaded on first use; failures are cached as their reason.
+    fn load(&self, i: usize) -> &Loaded {
+        self.loaded[i].get_or_init(|| {
+            let registry = &self.registries[i];
+            let listing = registry.listing().map_err(|e| e.to_string())?;
+            for bad in &listing.invalid {
+                self.warn(format!(
+                    "warning: skipping {} in registry {}: {}",
+                    bad.label,
+                    registry.location(),
+                    bad.reason
+                ));
+            }
+            Ok(listing)
+        })
+    }
+
+    /// The repository called `name`, from the first registry that lists it. Fails if a registry
+    /// with higher priority is unavailable or lists `name` as an invalid entry.
+    pub fn get(&self, name: &str) -> Result<Entry> {
+        self.resolve(name, None)
+    }
+
+    /// Like [`get`](Self::get), but an unavailable higher-priority registry only produces a
+    /// warning when the entry found in a lower one has the URL `locked_url` from aip.lock.
+    pub fn get_locked(&self, name: &str, locked_url: &str) -> Result<Entry> {
+        self.resolve(name, Some(locked_url))
+    }
+
+    fn resolve(&self, name: &str, locked_url: Option<&str>) -> Result<Entry> {
+        let mut unavailable: Vec<(String, String)> = Vec::new();
+        for (i, registry) in self.registries.iter().enumerate() {
+            let listing = match self.load(i) {
+                Ok(listing) => listing,
+                Err(reason) => {
+                    unavailable.push((registry.location(), reason.clone()));
+                    continue;
+                }
+            };
+            if let Some(bad) = listing
+                .invalid
+                .iter()
+                .find(|b| b.name.as_deref() == Some(name))
+            {
+                return Err(Error::new(format!(
+                    "repository '{name}' in registry {} is invalid: {}",
+                    registry.location(),
+                    bad.reason
+                )));
+            }
+            let Some(entry) = listing.entries.iter().find(|e| e.name == name) else {
+                continue;
+            };
+            let location = registry.location();
+            if unavailable.is_empty() {
+                return Ok(entry.clone());
+            }
+            if locked_url == Some(entry.url.as_str()) {
+                for (broken, reason) in &unavailable {
+                    self.warn(format!(
+                        "warning: registry {broken} is unavailable ({reason}); using {location} for '{name}' because it matches aip.lock"
+                    ));
+                }
+                return Ok(entry.clone());
+            }
+            let (broken, reason) = &unavailable[0];
+            return Err(Error::new(format!(
+                "cannot resolve '{name}': registry {broken} is unavailable ({reason}) and has priority over {location}, which lists it; fix or remove the broken registry"
+            )));
+        }
+        Err(self.unknown(name, &unavailable))
+    }
+
+    fn unknown(&self, name: &str, unavailable: &[(String, String)]) -> Error {
         let locations: Vec<_> = self.registries.iter().map(|r| r.location()).collect();
-        let similar: Vec<String> = entries
+        let similar: Vec<String> = self
+            .merged()
             .iter()
             .filter(|e| {
                 e.name.ends_with(&format!("/{name}")) || e.name.starts_with(&format!("{name}/"))
@@ -122,21 +282,47 @@ impl Registries {
         } else {
             format!("; did you mean {}?", similar.join(", "))
         };
-        Err(Error::new(format!(
-            "unknown repository '{name}' (not listed in any registry: {}){hint}",
+        let broken = if unavailable.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<_> = unavailable
+                .iter()
+                .map(|(loc, reason)| format!("{loc}: {reason}"))
+                .collect();
+            format!(" (unavailable: {})", list.join("; "))
+        };
+        Error::new(format!(
+            "unknown repository '{name}' (not listed in any registry: {}){hint}{broken}",
             locations.join(", ")
-        )))
+        ))
     }
 
-    /// All repositories, first registry wins on duplicate names.
+    /// Entries of all registries that load, first registry wins on duplicate names.
+    fn merged(&self) -> Vec<Entry> {
+        let mut merged: Vec<Entry> = Vec::new();
+        for i in 0..self.registries.len() {
+            if let Ok(listing) = self.load(i) {
+                for entry in &listing.entries {
+                    if !merged.iter().any(|e| e.name == entry.name) {
+                        merged.push(entry.clone());
+                    }
+                }
+            }
+        }
+        merged
+    }
+
+    /// All repositories of the registries that load (one warning per skipped registry), first
+    /// registry wins on duplicate names.
     pub fn entries(&self) -> Result<Vec<Entry>> {
         if self.entries.get().is_none() {
-            let mut merged: Vec<Entry> = Vec::new();
-            for registry in &self.registries {
-                for entry in registry.repositories()? {
-                    if !merged.iter().any(|e| e.name == entry.name) {
-                        merged.push(entry);
-                    }
+            let merged = self.merged();
+            for (i, registry) in self.registries.iter().enumerate() {
+                if let Err(reason) = self.load(i) {
+                    self.warn(format!(
+                        "warning: skipping registry {}: {reason}",
+                        registry.location()
+                    ));
                 }
             }
             let _ = self.entries.set(merged);
@@ -208,24 +394,22 @@ pub fn derive_name(url: &str) -> Result<String> {
 }
 
 /// Checks a registry entry (name, no credentials in the URL), resolves a relative local URL
-/// against `base` and derives a missing name from the URL. `location` names the registry in
-/// error messages.
-pub(crate) fn validated_entry(raw: RawEntry, base: &Path, location: &str) -> Result<Entry> {
+/// against `base` and derives a missing name from the URL. The reason never echoes the URL.
+pub(crate) fn check_entry(raw: &RawEntry, base: &Path) -> std::result::Result<Entry, String> {
     if let Some(name) = raw.name.as_deref().filter(|n| !valid_repository_name(n)) {
-        return Err(Error::new(format!(
-            "invalid repository name '{name}' in registry {location} (use lowercase letters, digits, '.', '_', '-', segments separated by '/')"
-        )));
+        return Err(format!(
+            "invalid repository name '{name}' (use lowercase letters, digits, '.', '_', '-', segments separated by '/')"
+        ));
     }
     // The URL reaches `git config` as a value; a leading '-' must never look like an option.
     if raw.url.starts_with('-') {
-        return Err(Error::new("URL must not start with '-'"))
-            .context(|| format!("{} in {location}", raw.label()));
+        return Err("URL must not start with '-'".to_string());
     }
-    check_no_credentials(&raw.url).context(|| format!("{} in {location}", raw.label()))?;
-    let url = resolve_url(&raw.url, base)?;
-    let name = match raw.name {
-        Some(name) => name,
-        None => derive_name(&url).context(|| format!("repository in {location}"))?,
+    check_no_credentials(&raw.url).map_err(|e| e.to_string())?;
+    let url = resolve_url(&raw.url, base).map_err(|e| e.to_string())?;
+    let name = match &raw.name {
+        Some(name) => name.clone(),
+        None => derive_name(&url).map_err(|e| e.to_string())?,
     };
     Ok(Entry { name, url })
 }
@@ -450,13 +634,8 @@ mod tests {
             name: Some("x".into()),
             url: "--upload-pack=evil".into(),
         };
-        let err = validated_entry(raw, Path::new("."), "reg.json")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "repository 'x' in reg.json: URL must not start with '-'"
-        );
+        let err = check_entry(&raw, Path::new(".")).unwrap_err();
+        assert_eq!(err, "URL must not start with '-'");
     }
 
     fn no_context() -> RegistryContext {
@@ -682,7 +861,10 @@ mod tests {
             r#"{"repositories": [{"url": "https://a/o/r.git"}, {"url": "git@b:o/r.git"}]}"#,
         );
         let err = dup.repositories().unwrap_err().to_string();
-        assert!(err.contains("duplicate repository name 'o/r'"), "{err}");
+        assert!(
+            err.contains("repository 'o/r'") && err.contains("listed more than once"),
+            "{err}"
+        );
 
         let registries = Registries::new(vec![json]);
         let err = registries.get("skills").unwrap_err().to_string();
@@ -721,5 +903,142 @@ mod tests {
             .repositories()
             .unwrap();
         assert_eq!(repos[0].name, "acme/priv");
+    }
+
+    fn dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aip-{tag}-{}", std::process::id()))
+    }
+
+    fn broken_first(dir: &Path, second: &str) -> Registries {
+        let broken = json_registry(dir, "broken.json", "{not json");
+        let good = json_registry(dir, "good.json", second);
+        Registries::new(vec![broken, good])
+    }
+
+    const PKG: &str = r#"{"repositories": [{"name": "pkg", "url": "https://good/pkg.git"}]}"#;
+
+    #[test]
+    fn broken_higher_registry_blocks_lower_match() {
+        let dir = dir("prio");
+        let r = broken_first(&dir, PKG);
+        let err = r.get("pkg").unwrap_err().to_string();
+        assert!(
+            err.starts_with("cannot resolve 'pkg': registry ")
+                && err.contains("broken.json is unavailable (invalid JSON")
+                && err.contains("has priority over")
+                && err.contains("good.json, which lists it; fix or remove the broken registry"),
+            "{err}"
+        );
+        assert_eq!(err.matches("broken.json").count(), 1, "{err}");
+        let err = r.get("nope").unwrap_err().to_string();
+        assert!(
+            err.contains("unknown repository 'nope'") && err.contains("(unavailable: "),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_locked_accepts_only_the_locked_url() {
+        let dir = dir("locked");
+        let r = broken_first(&dir, PKG);
+        assert_eq!(
+            r.get_locked("pkg", "https://good/pkg.git").unwrap().url,
+            "https://good/pkg.git"
+        );
+        let err = r
+            .get_locked("pkg", "https://evil/pkg.git")
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("cannot resolve 'pkg'"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_lower_registry_is_not_consulted_for_earlier_names() {
+        let dir = dir("lower");
+        let good = json_registry(&dir, "good.json", PKG);
+        let broken = json_registry(&dir, "broken.json", "{not json");
+        let r = Registries::new(vec![good, broken]);
+        assert_eq!(r.get("pkg").unwrap().name, "pkg");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_skip_broken_registries() {
+        let dir = dir("search");
+        let r = broken_first(&dir, PKG);
+        let names: Vec<_> = r.entries().unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["pkg"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_entries_are_skipped_but_their_names_stay_claimed() {
+        let dir = dir("claimed");
+        let first = json_registry(
+            &dir,
+            "first.json",
+            r#"{"repositories": [
+                {"name": "bad", "url": "https://tok@h/bad.git"},
+                {"url": "https://h/o/derived.git/--x"},
+                {"url": "--evil"},
+                {"name": "ok", "url": "https://first/ok.git"}]}"#,
+        );
+        let second = json_registry(
+            &dir,
+            "second.json",
+            r#"{"repositories": [{"name": "bad", "url": "https://second/bad.git"}]}"#,
+        );
+        let r = Registries::new(vec![first, second]);
+        assert_eq!(r.get("ok").unwrap().url, "https://first/ok.git");
+        let err = r.get("bad").unwrap_err().to_string();
+        assert!(
+            err.starts_with("repository 'bad' in registry ")
+                && err.contains("first.json is invalid: URL contains credentials")
+                && !err.contains("tok@"),
+            "{err}"
+        );
+        assert_eq!(r.entries().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_name_errors_only_that_name() {
+        let dir = dir("dups");
+        let r = Registries::new(vec![json_registry(
+            &dir,
+            "d.json",
+            r#"{"repositories": [{"url": "https://a/o/r.git"}, {"url": "git@b:o/r.git"}, {"name": "fine", "url": "https://h/f.git"}]}"#,
+        )]);
+        let err = r.get("o/r").unwrap_err().to_string();
+        assert!(
+            err.contains("is invalid: name is listed more than once"),
+            "{err}"
+        );
+        assert!(r.get("fine").is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_git_invalid_entry_claims_its_name() {
+        let dir = dir("inline-claim");
+        let bad = RegistryConfig::Git {
+            name: None,
+            url: "https://u:secret@h/acme/priv.git".into(),
+        }
+        .open(&dir, &no_context());
+        let public = json_registry(
+            &dir,
+            "p.json",
+            r#"{"repositories": [{"name": "acme/priv", "url": "https://pub/priv.git"}]}"#,
+        );
+        let r = Registries::new(vec![bad, public]);
+        let err = r.get("acme/priv").unwrap_err().to_string();
+        assert!(
+            err.contains("is invalid: URL contains credentials") && !err.contains("secret"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

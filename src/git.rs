@@ -5,6 +5,7 @@
 
 use crate::registry::is_reserved_device_name;
 use crate::{Context, Error, Result, filelock, fnv1a};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -225,11 +226,12 @@ impl Repo {
         Ok(Some(String::from_utf8_lossy(&out).into_owned()))
     }
 
-    /// Writes the tree at `path` in commit `sha` into `dest` (created if missing).
+    /// Writes the tree at `path` in commit `sha` into `dest` (created if missing). Returns the
+    /// blob id of every file written, by its `/`-separated path relative to `dest`.
     ///
     /// Symlinks are written as regular files containing their target, like git on systems
     /// without symlink support; submodules are skipped.
-    pub fn export(&self, sha: &str, path: &str, dest: &Path) -> Result<()> {
+    pub fn export(&self, sha: &str, path: &str, dest: &Path) -> Result<BTreeMap<String, String>> {
         self.export_limited(
             sha,
             path,
@@ -248,7 +250,7 @@ impl Repo {
         max_file: u64,
         max_total: u64,
         max_files: usize,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<String, String>> {
         let prefix = format!("{path}/");
         let out = self.git(&["ls-tree", "-r", "-l", "-z", sha, "--", &prefix])?;
         // Validate everything before writing anything.
@@ -278,6 +280,7 @@ impl Repo {
             files.push((entry, relative));
         }
         fs::create_dir_all(dest).context(|| format!("cannot create {}", dest.display()))?;
+        let mut written = BTreeMap::new();
         // ponytail: one `git cat-file` process per file; switch to `cat-file --batch` if skills get large.
         for (entry, relative) in files {
             let target = relative
@@ -295,8 +298,14 @@ impl Repo {
                 fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
                     .context(|| format!("cannot set permissions on {}", target.display()))?;
             }
+            written.insert(relative.to_string(), entry.oid.to_string());
         }
-        Ok(())
+        Ok(written)
+    }
+
+    /// Blob ids that `files` would have in this repository; see [`hash_files`].
+    pub fn hash_files(&self, base: &Path, files: &[&str]) -> Result<Vec<String>> {
+        hash_files(Some(&self.dir), base, files)
     }
 
     fn git(&self, args: &[&str]) -> Result<Vec<u8>> {
@@ -312,6 +321,43 @@ impl Repo {
         cmd.arg("--git-dir").arg(&self.dir).args(args);
         cmd
     }
+}
+
+/// Blob ids of `files` (`/`-separated paths relative to `base`), hashed by one
+/// `git hash-object` without filters, so they compare to the ids in a tree. `git_dir` sets the
+/// object format (SHA-1 or SHA-256); without it git uses SHA-1.
+pub fn hash_files(git_dir: Option<&Path>, base: &Path, files: &[&str]) -> Result<Vec<String>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base =
+        std::path::absolute(base).context(|| format!("cannot resolve {}", base.display()))?;
+    let mut cmd = Command::new("git");
+    match git_dir {
+        Some(dir) => {
+            let dir =
+                std::path::absolute(dir).context(|| format!("cannot resolve {}", dir.display()))?;
+            cmd.arg("--git-dir").arg(dir);
+        }
+        // Keep git from picking up a repository around `base`, whose format may be SHA-256.
+        None => {
+            cmd.env_remove("GIT_DIR")
+                .env("GIT_CEILING_DIRECTORIES", base.parent().unwrap_or(&base));
+        }
+    }
+    cmd.current_dir(&base)
+        .args(["hash-object", "--no-filters", "--stdin-paths"]);
+    let input: String = files.iter().map(|f| format!("{f}\n")).collect();
+    let oids = lines(&success(output(&mut cmd, Some(input.as_bytes()))?)?);
+    if oids.len() != files.len() {
+        return Err(Error::new(format!(
+            "git hash-object returned {} ids for {} files in {}",
+            oids.len(),
+            files.len(),
+            base.display()
+        )));
+    }
+    Ok(oids)
 }
 
 fn check_file_size(path: &str, size: u64, max_file: u64) -> Result<()> {
@@ -358,11 +404,21 @@ fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<Output> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(cannot_run)?;
-    if let Some(input) = input {
+    // Write from another thread: git may fill its stdout pipe before it has read all input.
+    let writer = input.map(|input| {
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        stdin.write_all(input).map_err(cannot_run)?;
+        let input = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&input))
+    });
+    let out = child.wait_with_output().map_err(cannot_run)?;
+    if let Some(writer) = writer {
+        let written = writer.join().expect("stdin writer does not panic");
+        // A git that exits early closes its stdin; its own error explains more than that.
+        if out.status.success() {
+            written.map_err(cannot_run)?;
+        }
     }
-    child.wait_with_output().map_err(cannot_run)
+    Ok(out)
 }
 
 fn success(output: Output) -> Result<Vec<u8>> {
@@ -666,8 +722,17 @@ mod tests {
         assert!(err.contains("too large"), "{err}");
         assert!(!dest.exists(), "nothing is written when validation fails");
 
-        repo.export(&sha, "skills/a", &dest).unwrap();
+        let files = repo.export(&sha, "skills/a", &dest).unwrap();
         assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"hello");
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["SKILL.md", "big.bin"]);
+        // Ids hashed from disk match the tree, with and without the mirror.
+        let disk = repo.hash_files(&dest, &["SKILL.md", "big.bin"]).unwrap();
+        assert_eq!(disk, [files["SKILL.md"].clone(), files["big.bin"].clone()]);
+        assert_eq!(
+            hash_files(None, &dest, &["SKILL.md"]).unwrap()[0],
+            files["SKILL.md"]
+        );
+        assert!(hash_files(None, &dest, &[]).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 

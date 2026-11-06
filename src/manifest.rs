@@ -1,9 +1,11 @@
 //! `aip.json` (what the user requires) and `aip.lock` (what was resolved), modelled on Composer.
 
-use crate::registry::RegistryConfig;
+use crate::registry::{self, RegistryConfig};
 use crate::{Context, Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -19,9 +21,9 @@ pub struct Manifest {
     /// Provider ids (see `aip detect`) whose skill folders receive installed skills.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
-    /// Package name → version constraint.
+    /// Package name → version constraint, optionally with a folder name.
     #[serde(default)]
-    pub require: BTreeMap<String, String>,
+    pub require: BTreeMap<String, Requirement>,
     /// Unknown keys are kept as-is.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -31,6 +33,79 @@ impl Manifest {
     /// `None` if the file does not exist.
     pub fn read(path: &Path) -> Result<Option<Self>> {
         read_json(path)
+    }
+}
+
+/// A `require` entry: `"^1.0"`, or `{"version": "^1.0", "as": "other-name"}` to install the
+/// skill under another folder name. Written back as a plain string when there is no alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub version: String,
+    /// Folder name to install the skill as (`"as"`), instead of the skill's own name.
+    pub alias: Option<String>,
+}
+
+impl From<&str> for Requirement {
+    fn from(version: &str) -> Self {
+        Self {
+            version: version.to_string(),
+            alias: None,
+        }
+    }
+}
+
+impl Serialize for Requirement {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let Some(alias) = &self.alias else {
+            return serializer.serialize_str(&self.version);
+        };
+        let mut object = serializer.serialize_struct("Requirement", 2)?;
+        object.serialize_field("version", &self.version)?;
+        object.serialize_field("as", alias)?;
+        object.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Requirement {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Object {
+            version: String,
+            #[serde(rename = "as", default)]
+            alias: Option<String>,
+        }
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = Requirement;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    r#"a version constraint or {"version": "<constraint>", "as": "<folder>"}"#,
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, version: &str) -> std::result::Result<Requirement, E> {
+                Ok(version.into())
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Requirement, A::Error> {
+                let object = Object::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                if let Some(alias) = object.alias.as_deref().filter(|a| !registry::valid_name(a)) {
+                    return Err(de::Error::custom(format!(
+                        "invalid \"as\" '{alias}' (use lowercase letters, digits, '.', '_', '-')"
+                    )));
+                }
+                Ok(Requirement {
+                    version: object.version,
+                    alias: object.alias,
+                })
+            }
+        }
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -82,6 +157,9 @@ pub struct LockedPackage {
     pub source: Source,
     /// Skill folder inside the repository.
     pub path: String,
+    /// Folder name the skill is installed as, from `"as"` in aip.json.
+    #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,6 +228,39 @@ mod tests {
     }
 
     #[test]
+    fn require_takes_a_string_or_an_object_with_alias() {
+        let text = r#"{"require": {"a/pdf": "^1.0", "b/pdf": {"version": "^2.0", "as": "b-pdf"}, "c/x": {"version": "*"}}}"#;
+        let manifest: Manifest = serde_json::from_str(text).unwrap();
+        assert_eq!(manifest.require["a/pdf"], "^1.0".into());
+        assert_eq!(
+            manifest.require["b/pdf"],
+            Requirement {
+                version: "^2.0".into(),
+                alias: Some("b-pdf".into())
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&manifest).unwrap(),
+            r#"{"require":{"a/pdf":"^1.0","b/pdf":{"version":"^2.0","as":"b-pdf"},"c/x":"*"}}"#
+        );
+        for (bad, why) in [
+            (
+                r#"{"version": "*", "as": "Bad/Name"}"#,
+                "invalid \"as\" 'Bad/Name'",
+            ),
+            (r#"{"version": "*", "alias": "x"}"#, "unknown field `alias`"),
+            (r#"{"as": "x"}"#, "missing field `version`"),
+            ("1", "a version constraint or"),
+        ] {
+            let text = format!(r#"{{"require": {{"a/b": {bad}}}}}"#);
+            let err = serde_json::from_str::<Manifest>(&text)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn readme_example_parses() {
         let text = r#"{"registries": [{"type": "json", "path": "registry.json"}], "providers": ["codex"], "require": {"a/b": "^1.0"}}"#;
         let manifest: Manifest = serde_json::from_str(text).unwrap();
@@ -169,6 +280,7 @@ mod tests {
             description: None,
             source: Source::git("u", "sha"),
             path: "skills/x".into(),
+            alias: None,
         };
         let mut lock = Lock::default();
         lock.upsert(pkg("b/x", "1.0.0"));

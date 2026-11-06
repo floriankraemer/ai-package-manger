@@ -24,23 +24,26 @@ Names become folder names, and the lock file is user-editable, so neither is tru
 | Skill name (package) | `valid_name`: starts with `a-z` or `0-9`, then `a-z 0-9 . _ -`. Rules out `..`, separators, drive letters, hidden folders. | `registry::valid_name`, `split_package` |
 | Repository name (registry), explicit or derived from the URL (`owner/repo`) | `valid_repository_name`: `/`-separated segments, each a `valid_name`. `derive_name` lowercases the URL path and fails when a segment is invalid ([ADR 0010](../decisions/0010-repository-names-from-urls.md)). | `registry::valid_repository_name`, `registry::derive_name` |
 | Package name from the command line, `aip.json`, `aip.lock` | `split_package` (repository is everything before the last `/`) | `ops.rs` |
-| Lock `path` | Must equal `skills/<skill>`. A lock cannot point to other folders in the repository. | `ops::skill_of` |
+| Lock `path` | Must equal `skills/<skill>`. A lock cannot point to other folders in the repository. | `ops::folder_of` |
+| `"as"` (folder alias) in `aip.json`, `aip.lock`, `--as` | `valid_name`, like a skill name. The `aip.json` object form denies unknown keys. | `manifest::Requirement`, `ops::folder_of`, `ops::install_as` |
 | Lock `reference` against `version` | A tag version must be the commit of a tag the resolver would pick for it; `dev-<branch>` must be a commit on that branch. Checked for every package before it is exported. | `ops::lock_matches` |
 | Skill folder paths (project scope) | No existing component between the project root and a provider's skill folder may be a symbolic link. Global scope is not checked, because dotfiles are often symlinked. | `ops::checked_dir` |
 | Skill names found by `search` | Skipped when invalid. | `ops::search` |
-| Branch in `dev-<branch>` | No leading `-`, `..`, whitespace, control characters or `~ ^ : ? * [ \`. | `constraint::valid_branch` |
-| Registry entries | Valid unique names, no unknown keys (`deny_unknown_fields`). | `registry/json.rs`, `registry/git.rs` |
+| Branch in `dev-<branch>` | No leading `-`, `..`, whitespace, control characters or `~ ^ : ? * [ \ #`. | `constraint::valid_branch` |
+| Commit pin `#<hex>` | 7 to 64 hexadecimal digits; resolved with `rev-parse --verify` and checked with `merge-base --is-ancestor` against the branch. | `constraint::Constraint::parse`, `ops::Resolver::resolve` |
+| Stability flag `@dev\|alpha\|beta\|RC\|stable` | Range constraints only; a pre-release matches if its stability is at least the flag. | `constraint::Stability` |
+| Registry entries | Valid unique names, no unknown keys (`deny_unknown_fields`). An invalid entry is skipped with a warning, but its name stays claimed. | `registry::Listing::collect`, `registry/json.rs`, `registry/git.rs` |
 | Repository URLs | No credentials (`user:secret@`, or `token@` for http/https). The URL is not echoed. | `registry::check_no_credentials` |
-| Repository URLs, leading `-` | Rejected, so `git config` never reads the URL as an option. The URL is not echoed. | `registry::validated_entry` |
+| Repository URLs, leading `-` | Rejected, so `git config` never reads the URL as an option. The URL is not echoed. | `registry::check_entry` |
 | Git invocations | `--` before the URL in `clone`, and before paths in `ls-tree`. | `git.rs` |
 
 Known gaps in this area are listed in [11](11-risks-and-technical-debt.md).
 
 ## Safe writes
 
-- **Plan before write.** `plan` runs fully, including the ownership check and duplicate skill name check, before any file is touched. `--dry-run` stops here and reports the plan.
-- **Stage everything, then commit.** Every export (each package in each target) goes to `<target>/.<skill>.aip-tmp` first, with its marker. If any export fails, all staging folders are deleted and nothing else has changed. Only then are `aip.json` and `aip.lock` written.
-- **Swap.** Each skill folder is moved to `.<skill>.aip-old`, the staging folder is renamed into place, and the old folder is deleted. Removals and pruned folders are deleted last.
+- **Plan before write.** `unique_folders` and `plan` run fully, including the duplicate folder check, the ownership check and the local-changes check, before any file is touched. `--dry-run` stops here and reports the plan.
+- **Stage everything, then commit.** Every export (each package in each target) goes to `<target>/.<folder>.aip-tmp` first, with its marker. For a package with `"as"`, the staged `SKILL.md` gets `name: <alias>` (`ops::rename_skill`), and its marker records the id of the rewritten file. If any export fails, all staging folders are deleted and nothing else has changed. Only then are `aip.json` and `aip.lock` written.
+- **Swap.** Each skill folder is moved to `.<folder>.aip-old`, the staging folder is renamed into place, and the old folder is deleted. Removals and pruned folders are deleted last.
 - **Repair by markers.** If a swap fails after the lock was written, the folders' markers show which ones are stale, and `aip install` rewrites them. The window is marked `ponytail:` in `ops::finish`.
 - **Trusted sources.** `finish` checks that every locked `source.url` equals the URL the registries list for the repository, before `plan`. A mismatch is an error; `aip update <name>` repairs it.
 - **Trusted references.** Before exporting, `Resolver::locked_repo` checks that the locked commit is what its version label says (see the validation table). A mismatch is an error; `aip update <name>` repairs it.
@@ -51,12 +54,17 @@ Known gaps in this area are listed in [11](11-risks-and-technical-debt.md).
 
 ## Ownership of skill folders
 
-- Every skill folder aip installs holds `.aip-package`: `{"name": "<package>", "reference": "<commit sha>"}`.
+- Every skill folder aip installs holds `.aip-package`: `{"name": "<package>", "reference": "<commit sha>", "files": {"<path>": "<blob id>"}}`.
+- The folder name is the package's `"as"` if set, else its skill name (`ops::folder_of`). Ownership, pruning, rename takeover and deletion all work on that folder name. Two packages with the same folder are an error with a hint that suggests `"as"` (`ops::unique_folders`).
 - A folder belongs to package P if and only if its marker parses and names P. The lock is never used to decide ownership.
 - A folder is up to date if its marker names the package and the locked commit. Anything else is rewritten.
 - aip replaces a folder without a matching marker only with `--force`, and never deletes one. Removal of such a folder in a target gives `warning: not removing <path>: it was not installed by aip`.
 - A skill folder that is a symbolic link is never followed and counts as not installed by aip.
 - **Pruning.** Skill folders of known providers that are not in `aip.json` are scanned too. A folder there whose marker names a package of the old or new lock is deleted, so removing a provider or a package cleans every provider's folder.
+- **Takeover.** A folder whose marker names an old lock entry from the same repository is taken over without `--force` when that entry leaves the folder in this run: it was dropped (a rename) or got another `"as"`. No folder written in a run is deleted in the same run.
+- **Moves.** A changed `"as"` is copied from `aip.json` into the lock by `refresh`, without re-resolving. `plan` writes the new folder, deletes the old one if its marker names the package, and reports `Change::Update` with `folder: Some((old, new))`.
+- **Local changes.** `files` records the blob id of every exported file, from `ls-tree`. `ops::local_changes` lists missing, added (other than the marker) and differing files. It hashes all files present in one `git hash-object --no-filters --stdin-paths` (`git::hash_files`) with `--git-dir` of the cached mirror, so the ids use the repository's object format. Without a mirror it hashes as SHA-1 outside any repository, and treats 64-character ids as unknown. Markers without `files` are unknown, and unknown counts as unmodified.
+- `plan` calls `guard_changes` before it overwrites or deletes a folder of aip (targets, takeovers, pruned copies, removals and moves). A modified folder is an error unless `--force`. Folders that stay as they are are not hashed. `check` hashes every folder that holds the locked commit and reports `Status::ModifiedLocally`.
 - **Migration.** Folders from before markers existed have none. Such a folder is rewritten (with marker) without `--force` only if the old lock has the package from the same repository and the folder's `SKILL.md` equals the one at the old locked commit. This rule is for writing only; deletion always needs a marker.
 
 ## Caching as bare mirrors
@@ -124,6 +132,20 @@ Known gaps in this area are listed in [11](11-risks-and-technical-debt.md).
   Local paths and `file://` are rejected, so a registry cannot make aip read the user's file system.
 - `http::get` limits a download to 30 seconds per request and 10 MB, enforced while reading.
 - Names and credentials in entries go through the same checks as in file registries.
+
+## Registry failure isolation (dependency confusion)
+
+- `Registries` loads each registry lazily and at most once per run; success and failure are both cached.
+- `get(name)` walks the registries in priority order, and the first registry that lists `name` wins.
+- If a registry before the match failed to load, `get` returns an error.
+  It never falls through silently, because the lower registry could supply a different URL for the same name.
+- `get_locked(name, locked_url)` downgrades that error to a warning when the lower match has exactly the URL from aip.lock.
+- `entries()` (used by `search`) skips failed registries with one warning each.
+- Inside one document, an invalid entry is skipped with a warning, but the registry still claims its name (explicit, or derived from the URL).
+  `get` on a claimed name fails with `repository '<name>' in registry <location> is invalid`.
+  Duplicate names in one document are handled the same way.
+- Malformed JSON and a wrong top-level shape fail the whole registry.
+- Warnings never contain URLs and are printed once per run.
 
 ## Concurrency
 

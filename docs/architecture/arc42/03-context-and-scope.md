@@ -38,7 +38,7 @@ The harnesses themselves are not called; aip only writes files they pick up.
 | Command line | `clap`, exit code 0 or 1, errors as `error: <message>` on stderr |
 | Git | `git` child processes (`clone --mirror`, `fetch --prune`, `ls-tree`, `cat-file`, `rev-parse`, `for-each-ref`, `symbolic-ref`) |
 | Registry | JSON file on disk |
-| Configuration | `AIP_HOME`; `HOME`/`USERPROFILE`; `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for `detect --global` only |
+| Configuration | `AIP_HOME`; `HOME`/`USERPROFILE`; `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for `detect --global` and the global skill folders (`--global` installs) |
 
 ## Out of scope
 
